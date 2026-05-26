@@ -6,7 +6,7 @@ const whiteboardActionSchema = new Schema({}, { _id: false, strict: false });
 const whiteboardStateSchema = new Schema(
   {
     chatId: { type: String, required: true, unique: true, index: true },
-    lastActivity: { type: Date, default: Date.now, index: true },
+    lastActivity: { type: Date, default: Date.now },
     snapshot: {
       mime: { type: String, default: "" },
       key: { type: String, default: "" },
