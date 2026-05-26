@@ -1708,6 +1708,17 @@ io.on("connection", (socket) => {
     endEvent("webrtcSignal", startedAt, traceId);
   });
 
+  socket.on("screenShareSignal", (payload) => {
+    if (!payload?.chatId || !ensureJoined(socket, payload.chatId) || !canAccessChat(socket, payload.chatId)) return;
+    socket.to(payload.chatId).emit("screenShareSignal", {
+      chatId: payload.chatId,
+      sender: socket.user.email,
+      senderName: payload.senderName,
+      type: payload.type,
+      data: payload.data
+    });
+  });
+
   socket.on("whiteboardCursorLeave", (payload) => {
     const traceId = genTraceId(payload?.traceId);
     const startedAt = startEvent("whiteboardCursorLeave", traceId);
