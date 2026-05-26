@@ -24,6 +24,8 @@ const io = new Server(server, {
 });
 const whiteboardStates = new Map();
 const whiteboardPersistTimers = new Map();
+const codeEditorStates = new Map();
+const codeEditorPersistTimers = new Map();
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 
@@ -53,6 +55,7 @@ app.use((req, res, next) => {
 const User = require("./modules/User");
 const Message = require("./modules/Message");
 const WhiteboardState = require("./modules/WhiteboardState");
+const CodeEditorState = require("./modules/CodeEditorState");
 const Article = require("./modules/myData");
 const path = require("path");
 const objectStorage = require("./services/objectStorage");
@@ -392,6 +395,45 @@ function queueWhiteboardPersist(chatId) {
     }
   }, 220);
   whiteboardPersistTimers.set(chatId, timer);
+}
+
+async function loadCodeEditorState(chatId) {
+  if (!chatId) return { content: "// ابدأ الكتابة...\n", language: "javascript", revision: 0 };
+  if (codeEditorStates.has(chatId)) return codeEditorStates.get(chatId);
+  const doc = await CodeEditorState.findOne({ chatId });
+  const state = doc
+    ? { content: doc.content || "", language: doc.language || "javascript", revision: doc.revision || 0 }
+    : { content: "// ابدأ الكتابة...\n", language: "javascript", revision: 0 };
+  codeEditorStates.set(chatId, state);
+  return state;
+}
+
+function queueCodeEditorPersist(chatId) {
+  if (!chatId) return;
+  const existing = codeEditorPersistTimers.get(chatId);
+  if (existing) clearTimeout(existing);
+  const timer = setTimeout(async () => {
+    const state = codeEditorStates.get(chatId);
+    if (!state) return;
+    try {
+      await CodeEditorState.findOneAndUpdate(
+        { chatId },
+        {
+          chatId,
+          lastActivity: new Date(),
+          content: state.content,
+          language: state.language,
+          revision: state.revision,
+        },
+        { upsert: true, new: true }
+      );
+    } catch (err) {
+      console.error("CodeEditor persist error:", err.message);
+    } finally {
+      codeEditorPersistTimers.delete(chatId);
+    }
+  }, 1000);
+  codeEditorPersistTimers.set(chatId, timer);
 }
 
 // ═══════════════════════════════════════════════
@@ -1676,6 +1718,85 @@ io.on("connection", (socket) => {
       traceId,
     });
     endEvent("whiteboardCursorLeave", startedAt, traceId);
+  });
+
+  // ═══════════════════════════════════════════════
+  // Code Editor Events
+  // ═══════════════════════════════════════════════
+  socket.on("codeEditorJoin", async (payload, ack) => {
+    const traceId = genTraceId(payload?.traceId);
+    if (!payload?.chatId || !ensureJoined(socket, payload.chatId) || !canAccessChat(socket, payload.chatId)) return;
+    const state = await loadCodeEditorState(payload.chatId);
+    socket.emit("codeEditorState", {
+      chatId: payload.chatId,
+      content: state.content,
+      language: state.language,
+      revision: state.revision,
+      traceId,
+    });
+    ackOk(ack, traceId);
+  });
+
+  socket.on("codeEditorSync", async (payload) => {
+    if (!payload?.chatId || !ensureJoined(socket, payload.chatId) || !canAccessChat(socket, payload.chatId)) return;
+    if (isRateLimited(socket, "codeEditorSync", 40, 1000)) return; // rate limit per sec
+    const state = await loadCodeEditorState(payload.chatId);
+    state.content = payload.content || state.content;
+    state.revision = Math.max(state.revision, payload.revision || 0);
+    codeEditorStates.set(payload.chatId, state);
+    
+    socket.to(payload.chatId).emit("codeEditorSync", {
+      chatId: payload.chatId,
+      sender: socket.user.email,
+      content: state.content,
+      revision: state.revision,
+    });
+  });
+
+  socket.on("codeEditorSave", async (payload) => {
+    if (!payload?.chatId || !ensureJoined(socket, payload.chatId) || !canAccessChat(socket, payload.chatId)) return;
+    const state = await loadCodeEditorState(payload.chatId);
+    state.content = payload.content || state.content;
+    state.revision = Math.max(state.revision, payload.revision || 0);
+    codeEditorStates.set(payload.chatId, state);
+    queueCodeEditorPersist(payload.chatId);
+    socket.emit("codeEditorSaved", { chatId: payload.chatId });
+    socket.to(payload.chatId).emit("codeEditorSaved", { chatId: payload.chatId });
+  });
+
+  socket.on("codeEditorTyping", (payload) => {
+    if (!payload?.chatId || !ensureJoined(socket, payload.chatId) || !canAccessChat(socket, payload.chatId)) return;
+    socket.to(payload.chatId).emit("codeEditorTyping", {
+      chatId: payload.chatId,
+      sender: socket.user.email,
+      typing: payload.typing,
+    });
+  });
+
+  socket.on("codeEditorCursor", (payload) => {
+    if (!payload?.chatId || !ensureJoined(socket, payload.chatId) || !canAccessChat(socket, payload.chatId)) return;
+    socket.to(payload.chatId).emit("codeEditorCursor", {
+      chatId: payload.chatId,
+      sender: socket.user.email,
+      position: payload.position,
+    });
+  });
+
+  socket.on("codeEditorLanguage", async (payload) => {
+    if (!payload?.chatId || !ensureJoined(socket, payload.chatId) || !canAccessChat(socket, payload.chatId)) return;
+    const state = await loadCodeEditorState(payload.chatId);
+    state.language = payload.language || state.language;
+    codeEditorStates.set(payload.chatId, state);
+    queueCodeEditorPersist(payload.chatId);
+    socket.to(payload.chatId).emit("codeEditorLanguage", {
+      chatId: payload.chatId,
+      sender: socket.user.email,
+      language: state.language,
+    });
+  });
+
+  socket.on("codeEditorLeave", (payload) => {
+    if (!payload?.chatId) return;
   });
 
   socket.on("disconnect", () => {
