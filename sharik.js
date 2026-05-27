@@ -1190,6 +1190,65 @@ app.get("/api/admin/blogs", authMiddleware, async (req, res) => {
   }
 });
 
+// Admin: Get Reports
+app.get("/api/admin/reports", authMiddleware, async (req, res) => {
+  try {
+    const admin = await User.findById(req.userId);
+    if (!admin || admin.role !== "admin") {
+      return res.status(403).json({ error: "غير مصرح لك" });
+    }
+    const reports = await Report.find().sort({ createdAt: -1 }).limit(100).lean();
+    res.json({ reports });
+  } catch (err) {
+    res.status(500).json({ error: "خطأ في جلب البلاغات" });
+  }
+});
+
+// ═══════════════════════════════════════════════
+// 8) E2E TESTING HELPERS (Not protected)
+// ═══════════════════════════════════════════════
+
+app.put("/api/test/reset-user", async (req, res) => {
+  try {
+    // Allows resetting the test user account between E2E runs
+    const testEmail = "sharik@gmail.com";
+    await User.deleteMany({ email: testEmail });
+    await Match.deleteMany({ $or: [{ userA: testEmail }, { userB: testEmail }] });
+    res.json({ success: true, message: `Deleted testing records for ${testEmail}` });
+  } catch (err) {
+    res.status(500).json({ error: "خطأ في الجلب" });
+  }
+});
+
+app.post("/api/test/seed-match", async (req, res) => {
+  try {
+    const testEmail = "sharik@gmail.com";
+    const partnerEmail = "helper@sharik.com";
+    
+    // تأكد من وجود حساب المساعد للتشات
+    let helper = await User.findOne({ email: partnerEmail });
+    if (!helper) {
+      helper = await User.create({
+        username1: "المعلم", username2: "الآلي", email: partnerEmail, password: "NotARealPassword123",
+        learnSkills: ["Test"], teachSkills: ["JavaScript"]
+      });
+    }
+
+    const [userA, userB] = Match.makePair(testEmail, partnerEmail);
+    const existing = await Match.findOne({ userA, userB });
+    if (!existing) {
+        await Match.create({
+           userA, userB, initiator: partnerEmail, status: "pending"
+        });
+    } else {
+        await Match.updateOne({ userA, userB }, { status: "pending", initiator: partnerEmail });
+    }
+    res.json({ success: true, message: "تم إنشاء طلب مطابقة وهمي" });
+  } catch (err) {
+    res.status(500).json({ error: "خطأ في حقن المطابقة" });
+  }
+});
+
 // Forgot Password Request (Mock/Demo Logic)
 app.post("/api/forgot-password", async (req, res) => {
   try {
