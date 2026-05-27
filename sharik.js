@@ -735,6 +735,38 @@ app.get("/api/user/:email", authMiddleware, async (req, res) => {
 // 6) PROFILE EXTENSIONS APIs (Interactions, Reviews, Bio)
 // ═══════════════════════════════════════════════
 
+// Session Rating
+app.post("/api/session/rate", authMiddleware, async (req, res) => {
+  try {
+    const { ratedEmail, skill, rating, comment } = req.body;
+    if (!ratedEmail || !rating) return res.status(400).json({ error: "البيانات ناقصة" });
+    
+    const targetUser = await User.findOne({ email: ratedEmail });
+    if (!targetUser) return res.status(404).json({ error: "المستخدم غير موجود" });
+
+    // Ensure reviews array exists in the model virtually or dynamically
+    if (!targetUser.reviews) targetUser.reviews = [];
+    targetUser.reviews.push({
+      reviewer: req.userEmail || req.userId,
+      skill: skill || "عام",
+      rating: Number(rating),
+      comment: comment || "",
+      date: new Date().toISOString()
+    });
+
+    // Recalculate average rating if rating field exists
+    if (targetUser.rating !== undefined) {
+      const total = targetUser.reviews.reduce((acc, r) => acc + r.rating, 0);
+      targetUser.rating = total / targetUser.reviews.length;
+    }
+
+    await targetUser.save();
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: "خطأ في حفظ التقييم" });
+  }
+});
+
 // Update Bio
 app.put("/api/me/bio", authMiddleware, async (req, res) => {
   try {
@@ -1716,6 +1748,32 @@ io.on("connection", (socket) => {
       senderName: payload.senderName,
       type: payload.type,
       data: payload.data
+    });
+  });
+
+  socket.on("lessonStart", (payload) => {
+    if (!payload?.chatId || !ensureJoined(socket, payload.chatId)) return;
+    io.to(payload.chatId).emit("lessonStarted", {
+      chatId: payload.chatId,
+      senderEmail: socket.user.email,
+      senderName: payload.senderName,
+      skill: payload.skill
+    });
+  });
+
+  socket.on("sessionConfirm", (payload) => {
+    if (!payload?.chatId || !ensureJoined(socket, payload.chatId) || !canAccessChat(socket, payload.chatId)) return;
+    io.to(payload.chatId).emit("sessionConfirmed", {
+      chatId: payload.chatId,
+      confirmerEmail: socket.user.email,
+      senderName: payload.senderName,
+      skill: payload.skill
+    });
+    socket.to(payload.chatId).emit("sessionStartRequest", {
+      chatId: payload.chatId,
+      senderEmail: socket.user.email,
+      senderName: payload.senderName,
+      skill: payload.skill
     });
   });
 
