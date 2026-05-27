@@ -58,6 +58,7 @@ const WhiteboardState = require("./modules/WhiteboardState");
 const CodeEditorState = require("./modules/CodeEditorState");
 const Article = require("./modules/myData");
 const Report = require("./modules/Report");
+const Match = require("./modules/Match");
 const path = require("path");
 const objectStorage = require("./services/objectStorage");
 const crypto = require("crypto");
@@ -629,12 +630,13 @@ app.get("/api/matches", authMiddleware, async (req, res) => {
     }
 
     // field projection: نجيب الحقول اللي محتاجينها بس — أسرع بكتير
+    // NOTE: verifiedSkills filter relaxed — users without test results still show up
+    // so new / test accounts can discover matches and accept/reject requests.
     const allUsers = await User.find(
       {
         _id: { $ne: currentUser._id },
         learnSkills: { $exists: true, $ne: [] },
         teachSkills: { $exists: true, $ne: [] },
-        verifiedSkills: { $exists: true, $ne: [] },
         status: { $ne: "banned" }, // استثناء المستخدمين المحظورين من المطابقة
       },
       "email username1 username2 learnSkills teachSkills verifiedSkills avatar bio"
@@ -642,22 +644,25 @@ app.get("/api/matches", authMiddleware, async (req, res) => {
 
     const matches = allUsers
       .filter((user) => {
-        // يجب أن يمتلك المستخدم الآخر المهارة التي أريد تعلمها، وأن يكون قد اجتاز اختبارها
+        // يكفي أن يوجد تقاطع في المهارات (بدون اشتراط التحقق) لأغراض الاكتشاف
         const canTeachMe = user.teachSkills.some((s) =>
-          currentUser.learnSkills.includes(s) && user.verifiedSkills.includes(s)
+          currentUser.learnSkills.includes(s)
         );
-        // يجب أن أمتلك أنا المهارة التي يريد المستخدم الآخر تعلمها، وأن أكون قد اجتزت اختبارها
         const canLearnFrom = user.learnSkills.some((s) =>
-          currentUser.teachSkills.includes(s) && currentUser.verifiedSkills.includes(s)
+          currentUser.teachSkills.includes(s)
         );
-        // المطابقة تتم فقط إذا كان هناك تبادل منفعة (كل شخص يفيد الآخر)
         return canTeachMe && canLearnFrom;
       })
       .map((user) => {
-        const learnM = user.teachSkills.filter((s) => currentUser.learnSkills.includes(s) && user.verifiedSkills.includes(s)).length;
-        const teachM = user.learnSkills.filter((s) => currentUser.teachSkills.includes(s) && currentUser.verifiedSkills.includes(s)).length;
+        const uVerified = user.verifiedSkills || [];
+        const myVerified = currentUser.verifiedSkills || [];
+        const learnM = user.teachSkills.filter((s) => currentUser.learnSkills.includes(s)).length;
+        const teachM = user.learnSkills.filter((s) => currentUser.teachSkills.includes(s)).length;
+        // Bonus points for verified skills
+        const learnMV = user.teachSkills.filter((s) => currentUser.learnSkills.includes(s) && uVerified.includes(s)).length;
+        const teachMV = user.learnSkills.filter((s) => currentUser.teachSkills.includes(s) && myVerified.includes(s)).length;
         const total = currentUser.learnSkills.length + currentUser.teachSkills.length || 1;
-        const matchScore = Math.round(((learnM + teachM) / total) * 100);
+        const matchScore = Math.min(100, Math.round(((learnM + teachM + learnMV + teachMV) / (total * 2)) * 100) || Math.round(((learnM + teachM) / total) * 100));
         // بناء safe object يدوياً لأن lean() بيشيل الـ methods
         const safe = { ...user };
         delete safe.password;
@@ -907,7 +912,174 @@ app.post("/api/reports", authMiddleware, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════
-// 7) ADMIN & GAMIFICATION & NOTIFICATIONS APIs
+// 6b) NOTIFICATIONS API
+// ═══════════════════════════════════════════════
+
+// GET /api/notifications — جلب الإشعارات للمستخدم الحالي
+app.get("/api/notifications", authMiddleware, async (req, res) => {
+  try {
+    const user = await User.findById(req.userId).select("notifications").lean();
+    if (!user) return res.status(404).json({ error: "مستخدم غير موجود" });
+    const notifications = (user.notifications || []).slice().reverse(); // الأحدث أولاً
+    res.json({ notifications });
+  } catch (err) {
+    res.status(500).json({ error: "خطأ في جلب الإشعارات" });
+  }
+});
+
+// PATCH /api/notifications/read — تعليم كل الإشعارات كمقروءة
+app.patch("/api/notifications/read", authMiddleware, async (req, res) => {
+  try {
+    await User.findByIdAndUpdate(req.userId, {
+      $set: { "notifications.$[].read": true }
+    });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: "خطأ في تحديث الإشعارات" });
+  }
+});
+
+// ═══════════════════════════════════════════════
+// 6c) MATCH REQUESTS API (Inbox / Accept / Reject)
+// ═══════════════════════════════════════════════
+
+// GET /api/match-requests — جلب طلبات المطابقة الواردة (pending)
+app.get("/api/match-requests", authMiddleware, async (req, res) => {
+  try {
+    const me = await User.findById(req.userId).select("email").lean();
+    if (!me) return res.status(404).json({ error: "مستخدم غير موجود" });
+
+    const incoming = await Match.find({
+      $or: [{ userA: me.email }, { userB: me.email }],
+      initiator: { $ne: me.email },
+      status: "pending",
+    }).lean();
+
+    // جلب بيانات المرسل لكل طلب
+    const requesterEmails = incoming.map(m => m.initiator);
+    const requesters = await User.find(
+      { email: { $in: requesterEmails } },
+      "email username1 username2 avatar learnSkills teachSkills verifiedSkills"
+    ).lean();
+    const requesterMap = {};
+    requesters.forEach(u => {
+      requesterMap[u.email] = { ...u, name: u.username1 + " " + u.username2 };
+    });
+
+    const result = incoming.map(m => ({
+      matchId: m._id,
+      chatId: m.chatId,
+      status: m.status,
+      createdAt: m.createdAt,
+      requester: requesterMap[m.initiator] || { email: m.initiator, name: m.initiator },
+    }));
+
+    res.json({ requests: result });
+  } catch (err) {
+    res.status(500).json({ error: "خطأ في جلب طلبات المطابقة" });
+  }
+});
+
+// POST /api/match-requests — إرسال طلب مطابقة جديد
+app.post("/api/match-requests", authMiddleware, async (req, res) => {
+  try {
+    const me = await User.findById(req.userId).select("email username1 username2").lean();
+    if (!me) return res.status(404).json({ error: "مستخدم غير موجود" });
+    const { targetEmail } = req.body;
+    if (!targetEmail) return res.status(400).json({ error: "البريد المستهدف مطلوب" });
+    if (targetEmail.toLowerCase() === me.email) return res.status(400).json({ error: "لا يمكنك إرسال طلب لنفسك" });
+
+    const [userA, userB] = Match.makePair(me.email, targetEmail);
+    const existing = await Match.findOne({ userA, userB });
+    if (existing) {
+      return res.status(409).json({ error: "يوجد طلب مطابقة بالفعل بينكما", status: existing.status });
+    }
+
+    const match = await Match.create({
+      userA,
+      userB,
+      initiator: me.email,
+      status: "pending",
+    });
+
+    // إرسال إشعار للمستخدم المستهدف
+    const senderName = me.username1 + " " + me.username2;
+    await User.findOneAndUpdate(
+      { email: targetEmail },
+      {
+        $push: {
+          notifications: {
+            title: "طلب مطابقة جديد",
+            message: `أرسل لك ${senderName} طلب مطابقة لتبادل المهارات`,
+            type: "info",
+            read: false,
+            date: new Date(),
+          }
+        }
+      }
+    );
+
+    res.status(201).json({ success: true, match });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "خطأ في إرسال طلب المطابقة" });
+  }
+});
+
+// PATCH /api/match-requests/:matchId — قبول أو رفض طلب مطابقة
+app.patch("/api/match-requests/:matchId", authMiddleware, async (req, res) => {
+  try {
+    const me = await User.findById(req.userId).select("email username1 username2").lean();
+    if (!me) return res.status(404).json({ error: "مستخدم غير موجود" });
+
+    const { action } = req.body; // 'accept' or 'reject'
+    if (!action || !["accept", "reject"].includes(action)) {
+      return res.status(400).json({ error: "action يجب أن تكون accept أو reject" });
+    }
+
+    const match = await Match.findById(req.params.matchId);
+    if (!match) return res.status(404).json({ error: "الطلب غير موجود" });
+
+    // فقط المستلم (غير المُبادر) يمكنه الرد
+    const myEmail = me.email.toLowerCase();
+    const isRecipient = (match.userA === myEmail || match.userB === myEmail) && match.initiator !== myEmail;
+    if (!isRecipient) return res.status(403).json({ error: "لا يمكنك الرد على هذا الطلب" });
+    if (match.status !== "pending") return res.status(409).json({ error: "تم الرد على هذا الطلب مسبقاً" });
+
+    if (action === "accept") {
+      match.status = "accepted";
+      match.chatId = Match.buildChatId(match.userA, match.userB);
+
+      // إرسال إشعار للمُبادر
+      const responderName = me.username1 + " " + me.username2;
+      await User.findOneAndUpdate(
+        { email: match.initiator },
+        {
+          $push: {
+            notifications: {
+              title: "تم قبول طلب المطابقة! 🎉",
+              message: `قبل ${responderName} طلبك — يمكنك الآن بدء المحادثة`,
+              type: "success",
+              read: false,
+              date: new Date(),
+            }
+          }
+        }
+      );
+    } else {
+      match.status = "rejected";
+    }
+
+    await match.save();
+    res.json({ success: true, match });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "خطأ في الرد على الطلب" });
+  }
+});
+
+// ═══════════════════════════════════════════════
+// 7) ADMIN & GAMIFICATION APIs
 // ═══════════════════════════════════════════════
 
 // Get all users for admin dashboard (محمي بالـ role)
