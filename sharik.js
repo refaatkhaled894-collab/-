@@ -57,6 +57,7 @@ const Message = require("./modules/Message");
 const WhiteboardState = require("./modules/WhiteboardState");
 const CodeEditorState = require("./modules/CodeEditorState");
 const Article = require("./modules/myData");
+const Report = require("./modules/Report");
 const path = require("path");
 const objectStorage = require("./services/objectStorage");
 const crypto = require("crypto");
@@ -83,6 +84,19 @@ function structuredLog(event, payload = {}) {
 function genTraceId(seed = "") {
   if (seed && typeof seed === "string" && seed.length >= 8) return seed.slice(0, 64);
   return crypto.randomUUID();
+}
+
+function escapeHTML(str) {
+  if (!str) return "";
+  return String(str).replace(/[&<>'"]/g, 
+    tag => ({
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      "'": '&#39;',
+      '"': '&quot;'
+    }[tag] || tag)
+  );
 }
 
 function trackEvent(name) {
@@ -704,7 +718,7 @@ app.post("/api/messages", authMiddleware, async (req, res) => {
         messageId,
         sender: user.email,
         receiver,
-        text: text || "",
+        text: escapeHTML(text),
         attachments: attachments || [],
       });
       await message.save();
@@ -866,6 +880,29 @@ app.post("/api/reviews", authMiddleware, async (req, res) => {
     res.json({ success: true, reviews: targetUser.reviews });
   } catch (err) {
     res.status(500).json({ error: "خطأ في إضافة التقييم" });
+  }
+});
+
+// Report User
+app.post("/api/reports", authMiddleware, async (req, res) => {
+  try {
+    const { targetEmail, reason, chatId } = req.body;
+    if (!targetEmail || !reason) return res.status(400).json({ error: "بيانات البلاغ غير مكتملة" });
+
+    const reporter = await User.findById(req.userId);
+    if (!reporter) return res.status(404).json({ error: "المبلغ غير موجود" });
+
+    const report = new Report({
+      reporterEmail: reporter.email,
+      reportedEmail: targetEmail,
+      reason: escapeHTML(reason),
+      chatId: chatId || ""
+    });
+    
+    await report.save();
+    res.json({ success: true, message: "تم إرسال البلاغ وسيقوم المسؤولون بمراجعته بأقرب وقت" });
+  } catch (err) {
+    res.status(500).json({ error: "حدث خطأ أثناء إرسال البلاغ" });
   }
 });
 
@@ -1872,6 +1909,8 @@ io.on("connection", (socket) => {
     if (socket.data.joinedChats && socket.user?.email) {
       socket.data.joinedChats.forEach((chatId) => {
         socket.to(chatId).emit("whiteboardCursorLeave", { chatId, sender: socket.user.email });
+        // Emit offline event silently to peers (to handle lesson interruptions or chat offline states)
+        socket.to(chatId).emit("peerDisconnected", { chatId, sender: socket.user.email });
       });
     }
     console.log("🔴 User disconnected:", socket.id);
