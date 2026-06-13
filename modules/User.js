@@ -42,6 +42,9 @@ const userSchema = new Schema(
     role: { type: String, enum: ["user", "admin"], default: "user" },
     status: { type: String, enum: ["active", "banned"], default: "active" },
 
+    resetPasswordToken: { type: String, default: "" },
+    resetPasswordExpires: { type: Date, default: null },
+
     // 🎖 Gamification System
     gamifyPoints: { type: Number, default: 0 },
     gamifyLevel: { type: String, default: "عضو جديد" },

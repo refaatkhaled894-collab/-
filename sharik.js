@@ -54,7 +54,31 @@ app.use(express.urlencoded({ extended: true, limit: JSON_BODY_LIMIT }));
 app.use(express.json({ limit: JSON_BODY_LIMIT }));
 
 const cors = require("cors");
+app.use(helmet({
+  contentSecurityPolicy: false,
+  crossOriginEmbedderPolicy: false,
+}));
 app.use(cors({ origin: effectiveCorsOrigins, credentials: true }));
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: Number(process.env.RATE_LIMIT_AUTH_MAX || 30),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "محاولات كثيرة، حاول لاحقاً" },
+});
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: Number(process.env.RATE_LIMIT_API_MAX || 120),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "طلبات كثيرة، حاول لاحقاً" },
+});
+app.use("/api/login", authLimiter);
+app.use("/api/register", authLimiter);
+app.use("/api/forgot-password", authLimiter);
+app.use("/api/reset-password", authLimiter);
+app.use("/api/", apiLimiter);
 app.use((req, res, next) => {
   req.traceId = genTraceId(req.headers["x-trace-id"]);
   res.setHeader("x-trace-id", req.traceId);
@@ -79,7 +103,12 @@ const Article = require("./modules/myData");
 const Report = require("./modules/Report");
 const Match = require("./modules/Match");
 const { hasVerifiedTeachSkill, isBidirectionalMatch, calcMatchScore } = require("./modules/matchingHelpers");
-const { validateSkillTestSubmission } = require("./modules/skillTestRules");
+const { createSkillTestSession, gradeSkillTestSubmission } = require("./modules/skillTestService");
+const { getSkillsList } = require("./modules/skillQuestionBank");
+const { computeGamification, pointsForNewReview } = require("./modules/gamification");
+const { isEmailConfigured, sendMail } = require("./services/emailService");
+const rateLimit = require("express-rate-limit");
+const helmet = require("helmet");
 const path = require("path");
 const objectStorage = require("./services/objectStorage");
 const crypto = require("crypto");
@@ -155,10 +184,15 @@ async function hasAcceptedMatch(emailA, emailB) {
 }
 
 async function canAccessChatRoom(emailA, emailB) {
-  if (await hasAcceptedMatch(emailA, emailB)) return true;
-  const chatId = Match.buildChatId(emailA, emailB);
-  const existing = await Message.exists({ chatId });
-  return Boolean(existing);
+  return hasAcceptedMatch(emailA, emailB);
+}
+
+function attachGamification(safeUser) {
+  const g = computeGamification(safeUser);
+  safeUser.gamifyPoints = g.points;
+  safeUser.gamifyLevel = g.level;
+  safeUser.gamifyHelped = g.helped;
+  return safeUser;
 }
 
 function testEndpointGuard(req, res, next) {
@@ -562,6 +596,16 @@ function authMiddleware(req, res, next) {
 // ═══════════════════════════════════════════════
 // 1) AUTH APIs - Register & Login
 // ═══════════════════════════════════════════════
+app.get("/api/health", async (req, res) => {
+  const dbOk = mongoose.connection.readyState === 1;
+  res.status(dbOk ? 200 : 503).json({
+    ok: dbOk,
+    db: dbOk ? "connected" : "disconnected",
+    uptimeSec: Math.round(process.uptime()),
+    ts: new Date().toISOString(),
+  });
+});
+
 app.post("/api/register", async (req, res) => {
   try {
     const { username1, username2, email, password } = req.body;
@@ -620,7 +664,7 @@ app.get("/api/me", authMiddleware, async (req, res) => {
   try {
     const user = await User.findById(req.userId);
     if (!user) return res.status(404).json({ error: "مستخدم غير موجود" });
-    const safeUser = user.toSafeObject();
+    const safeUser = attachGamification(user.toSafeObject());
     safeUser.name = safeUser.username1 + " " + safeUser.username2;
     res.json({ user: safeUser });
   } catch (err) {
@@ -675,43 +719,84 @@ app.post("/api/skills", authMiddleware, async (req, res) => {
 // ═══════════════════════════════════════════════
 // 3) SKILL TEST APIs
 // ═══════════════════════════════════════════════
+app.get("/api/skill-test/skills", authMiddleware, async (req, res) => {
+  try {
+    const user = await User.findById(req.userId).select("teachSkills learnSkills").lean();
+    const skills = new Set(getSkillsList());
+    [...(user?.teachSkills || []), ...(user?.learnSkills || [])].forEach((s) => skills.add(s));
+    res.json({ skills: [...skills] });
+  } catch (err) {
+    res.status(500).json({ error: "خطأ في جلب المهارات" });
+  }
+});
+
+app.post("/api/skill-test/start", authMiddleware, async (req, res) => {
+  try {
+    const { skill } = req.body;
+    if (!skill || typeof skill !== "string") {
+      return res.status(400).json({ error: "المهارة مطلوبة" });
+    }
+    const session = createSkillTestSession(JWT_SECRET, req.userId, skill);
+    if (!session.ok) {
+      return res.status(400).json({ error: session.error });
+    }
+    res.json(session);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "خطأ في بدء الاختبار" });
+  }
+});
+
 app.post("/api/skill-test/submit", authMiddleware, async (req, res) => {
   try {
-    const validation = validateSkillTestSubmission(req.body);
-    if (!validation.ok) {
-      return res.status(400).json({ error: validation.error });
-    }
+    const { sessionToken, answers, skill } = req.body;
 
-    const user = await User.findById(req.userId).select("teachSkills verifiedSkills");
-    if (!user) return res.status(404).json({ error: "مستخدم غير موجود" });
-
-    const { skill, score, total, pct, passed } = validation;
-    const update = {};
-    update[`skillTestResults.${skill}`] = {
-      pct,
-      passed,
-      date: new Date().toISOString(),
-      score,
-      total,
-    };
-
-    if (passed) {
-      if (!(user.teachSkills || []).includes(skill)) {
-        return res.status(400).json({ error: "المهارة يجب أن تكون ضمن مهارات التعليم الخاصة بك" });
-      }
-      await User.findByIdAndUpdate(req.userId, {
-        $set: update,
-        $addToSet: { verifiedSkills: skill },
+    if (sessionToken && Array.isArray(answers)) {
+      const graded = gradeSkillTestSubmission(JWT_SECRET, req.userId, {
+        sessionToken,
+        answers,
+        skill,
       });
-    } else {
-      await User.findByIdAndUpdate(req.userId, { $set: update });
+      if (!graded.ok) {
+        return res.status(400).json({ error: graded.error });
+      }
+
+      const user = await User.findById(req.userId).select("teachSkills verifiedSkills");
+      if (!user) return res.status(404).json({ error: "مستخدم غير موجود" });
+
+      const { skill: gradedSkill, score, total, pct, passed } = graded;
+      const update = {};
+      update[`skillTestResults.${gradedSkill}`] = {
+        pct,
+        passed,
+        date: new Date().toISOString(),
+        score,
+        total,
+      };
+
+      if (passed) {
+        if (!(user.teachSkills || []).includes(gradedSkill)) {
+          return res.status(400).json({ error: "المهارة يجب أن تكون ضمن مهارات التعليم الخاصة بك" });
+        }
+        await User.findByIdAndUpdate(req.userId, {
+          $set: update,
+          $addToSet: { verifiedSkills: gradedSkill },
+        });
+      } else {
+        await User.findByIdAndUpdate(req.userId, { $set: update });
+      }
+
+      const updatedUser = await User.findById(req.userId);
+      const safeUser = attachGamification(updatedUser.toSafeObject());
+      safeUser.name = safeUser.username1 + " " + safeUser.username2;
+      return res.json({ user: safeUser, passed, score, total, pct });
     }
 
-    const updatedUser = await User.findById(req.userId);
-    const safeUser = updatedUser.toSafeObject();
-    safeUser.name = safeUser.username1 + " " + safeUser.username2;
-    res.json({ user: safeUser, passed });
+    return res.status(400).json({
+      error: "يجب إرسال جلسة الاختبار والإجابات. أعد الاختبار من البداية.",
+    });
   } catch (err) {
+    console.error(err);
     res.status(500).json({ error: "خطأ في حفظ نتيجة الاختبار" });
   }
 });
@@ -904,7 +989,7 @@ app.get("/api/user/:email", authMiddleware, async (req, res) => {
   try {
     const user = await User.findOne({ email: req.params.email });
     if (!user) return res.status(404).json({ error: "مستخدم غير موجود" });
-    const safeUser = user.toSafeObject();
+    const safeUser = attachGamification(user.toSafeObject());
     safeUser.name = safeUser.username1 + " " + safeUser.username2;
     res.json({ user: safeUser });
   } catch (err) {
@@ -921,25 +1006,27 @@ app.post("/api/session/rate", authMiddleware, async (req, res) => {
   try {
     const { ratedEmail, skill, rating, comment } = req.body;
     if (!ratedEmail || !rating) return res.status(400).json({ error: "البيانات ناقصة" });
-    
-    const targetUser = await User.findOne({ email: ratedEmail });
+
+    const reviewer = await User.findById(req.userId);
+    if (!reviewer) return res.status(404).json({ error: "المراجع غير موجود" });
+
+    const targetUser = await User.findOne({ email: ratedEmail.toLowerCase().trim() });
     if (!targetUser) return res.status(404).json({ error: "المستخدم غير موجود" });
 
-    // Ensure reviews array exists in the model virtually or dynamically
     if (!targetUser.reviews) targetUser.reviews = [];
     targetUser.reviews.push({
-      reviewer: req.userEmail || req.userId,
+      reviewerEmail: reviewer.email,
+      reviewerName: reviewer.username1 + " " + reviewer.username2,
       skill: skill || "عام",
       rating: Number(rating),
-      comment: comment || "",
-      date: new Date().toISOString()
+      comment: escapeHTML(String(comment || "").slice(0, 500)),
+      date: new Date(),
     });
 
-    // Recalculate average rating if rating field exists
-    if (targetUser.rating !== undefined) {
-      const total = targetUser.reviews.reduce((acc, r) => acc + r.rating, 0);
-      targetUser.rating = total / targetUser.reviews.length;
-    }
+    const pts = pointsForNewReview(targetUser, rating);
+    targetUser.gamifyPoints = (targetUser.gamifyPoints || 0) + pts;
+    const g = computeGamification(targetUser);
+    targetUser.gamifyLevel = g.level;
 
     await targetUser.save();
     res.json({ success: true });
@@ -1033,7 +1120,7 @@ app.post("/api/reviews", authMiddleware, async (req, res) => {
       reviewerEmail: reviewer.email,
       reviewerName: reviewer.username1 + " " + reviewer.username2,
       rating: Number(rating),
-      comment: comment || "",
+      comment: escapeHTML(String(comment || "").slice(0, 500)),
       date: new Date()
     };
 
@@ -1041,7 +1128,12 @@ app.post("/api/reviews", authMiddleware, async (req, res) => {
       targetUser.reviews[existingReviewIndex] = newReview;
     } else {
       targetUser.reviews.push(newReview);
+      const pts = pointsForNewReview(targetUser, rating);
+      targetUser.gamifyPoints = (targetUser.gamifyPoints || 0) + pts;
     }
+
+    const g = computeGamification(targetUser);
+    targetUser.gamifyLevel = g.level;
 
     await targetUser.save();
     res.json({ success: true, reviews: targetUser.reviews });
@@ -1289,9 +1381,14 @@ app.get("/api/admin/users", authMiddleware, async (req, res) => {
       activeSessions = await Message.distinct("chatId").then(r => r.length);
     } catch(_) { activeSessions = 0; }
 
+    const [verifiedAgg] = await User.aggregate([
+      { $project: { n: { $size: { $ifNull: ["$verifiedSkills", []] } } } },
+      { $group: { _id: null, total: { $sum: "$n" } } },
+    ]);
+
     const stats = {
       totalUsers: totalCount,
-      verifiedSkills: users.reduce((acc, u) => acc + (u.verifiedSkills?.length || 0), 0),
+      verifiedSkills: verifiedAgg?.total || 0,
       activeSessions,
       page,
       totalPages: Math.ceil(totalCount / limit)
@@ -1318,17 +1415,6 @@ app.put("/api/admin/users/:userId/status", authMiddleware, async (req, res) => {
     res.json({ success: true, status: targetUser.status });
   } catch (err) {
     res.status(500).json({ error: "Error updating status" });
-  }
-});
-
-// Get user notifications
-app.get("/api/notifications", authMiddleware, async (req, res) => {
-  try {
-    const user = await User.findById(req.userId);
-    if (!user) return res.status(404).json({ error: "User not found" });
-    res.json({ notifications: user.notifications || [] });
-  } catch (err) {
-    res.status(500).json({ error: "Error fetching notifications" });
   }
 });
 
@@ -1424,16 +1510,83 @@ app.post("/api/test/seed-match", testEndpointGuard, async (req, res) => {
   }
 });
 
-// Forgot Password Request (Mock/Demo Logic)
+// Forgot Password — إرسال رابط إعادة التعيين
 app.post("/api/forgot-password", async (req, res) => {
   try {
-    const { email } = req.body;
-    const user = await User.findOne({ email: email?.toLowerCase() });
-    if (!user) return res.status(404).json({ error: "البريد غير صحيح" });
-    // In real app: Generate token, send email via Nodemailer
-    res.json({ success: true, message: "تم إرسال رابط التعيين على البريد بنجاح!" });
+    const email = req.body.email?.toLowerCase().trim();
+    if (!email) return res.status(400).json({ error: "البريد مطلوب" });
+
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.json({
+        success: true,
+        message: "إذا كان البريد مسجلاً، ستصلك رسالة لإعادة تعيين كلمة المرور",
+      });
+    }
+
+    const resetToken = crypto.randomBytes(32).toString("hex");
+    const resetHash = crypto.createHash("sha256").update(resetToken).digest("hex");
+    user.resetPasswordToken = resetHash;
+    user.resetPasswordExpires = new Date(Date.now() + 60 * 60 * 1000);
+    await user.save();
+
+    const appUrl = (process.env.APP_URL || "https://sharij-532a3.web.app").replace(/\/$/, "");
+    const resetLink = `${appUrl}/login-signup/reset-password.html?token=${resetToken}&email=${encodeURIComponent(email)}`;
+
+    if (isEmailConfigured()) {
+      await sendMail({
+        to: email,
+        subject: "إعادة تعيين كلمة المرور — شارك",
+        text: `افتح الرابط لإعادة تعيين كلمة المرور (صالح ساعة واحدة):\n${resetLink}`,
+        html: `<p>اضغط <a href="${resetLink}">هنا</a> لإعادة تعيين كلمة المرور.</p><p>الرابط صالح لمدة ساعة.</p>`,
+      });
+    } else if (!isProduction) {
+      console.log("[dev] Password reset link:", resetLink);
+    } else {
+      return res.status(503).json({
+        error: "خدمة البريد غير مُعدّة. تواصل مع الدعم لإعادة تعيين كلمة المرور.",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: "إذا كان البريد مسجلاً، ستصلك رسالة لإعادة تعيين كلمة المرور",
+    });
   } catch (err) {
-    res.status(500).json({ error: "Server Error" });
+    console.error(err);
+    res.status(500).json({ error: "خطأ في معالجة الطلب" });
+  }
+});
+
+app.post("/api/reset-password", async (req, res) => {
+  try {
+    const { email, token, password } = req.body;
+    if (!email || !token || !password) {
+      return res.status(400).json({ error: "البيانات غير مكتملة" });
+    }
+    if (String(password).length < 8) {
+      return res.status(400).json({ error: "كلمة المرور يجب أن تكون 8 أحرف على الأقل" });
+    }
+
+    const resetHash = crypto.createHash("sha256").update(String(token)).digest("hex");
+    const user = await User.findOne({
+      email: email.toLowerCase().trim(),
+      resetPasswordToken: resetHash,
+      resetPasswordExpires: { $gt: new Date() },
+    });
+    if (!user) {
+      return res.status(400).json({ error: "الرابط غير صالح أو منتهي الصلاحية" });
+    }
+
+    user.password = password;
+    user.resetPasswordToken = "";
+    user.resetPasswordExpires = null;
+    await user.save();
+
+    res.json({ success: true, message: "تم تغيير كلمة المرور بنجاح" });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "خطأ في إعادة تعيين كلمة المرور" });
   }
 });
 
