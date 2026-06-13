@@ -11,16 +11,27 @@ process.on('unhandledRejection', (reason, promise) => {
 const app = express();
 // Port من متغيرات البيئة أو 3000 افتراضياً
 const port = Number(process.env.PORT) || 3000;
+const isProduction = process.env.NODE_ENV === "production";
+const CORS_ORIGINS = process.env.CORS_ORIGINS
+  ? process.env.CORS_ORIGINS.split(",").map((o) => o.trim()).filter(Boolean)
+  : null;
+const DEFAULT_CORS_ORIGINS = [
+  "https://sharij-532a3.web.app",
+  "https://sharij-532a3.firebaseapp.com",
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+];
+const effectiveCorsOrigins = CORS_ORIGINS || (isProduction ? DEFAULT_CORS_ORIGINS : ["*"]);
 const mongoose = require("mongoose");
 const http = require("http");
 const server = http.createServer(app);
 const { Server } = require("socket.io");
 const io = new Server(server, {
   cors: {
-    origin: "*",
+    origin: effectiveCorsOrigins,
     methods: ["GET", "POST"]
   },
-  maxHttpBufferSize: 30e6 // 30 MB
+  maxHttpBufferSize: 10e6 // 10 MB
 });
 const whiteboardStates = new Map();
 const whiteboardPersistTimers = new Map();
@@ -29,13 +40,21 @@ const codeEditorPersistTimers = new Map();
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 
-const JWT_SECRET = process.env.JWT_SECRET || "sharik_secret_key_2026_secure";
+const JWT_SECRET = process.env.JWT_SECRET || (isProduction ? null : "sharik_secret_key_2026_secure_dev_only");
+if (!JWT_SECRET) {
+  console.error("FATAL: JWT_SECRET must be set in production");
+  process.exit(1);
+}
 
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json({ limit: "30mb" }));
+const MAX_CACHED_CHATS = Number(process.env.MAX_CACHED_CHATS || 200);
+const MAX_NOTIFICATIONS = Number(process.env.MAX_NOTIFICATIONS || 100);
+const JSON_BODY_LIMIT = process.env.JSON_BODY_LIMIT || "5mb";
+
+app.use(express.urlencoded({ extended: true, limit: JSON_BODY_LIMIT }));
+app.use(express.json({ limit: JSON_BODY_LIMIT }));
 
 const cors = require("cors");
-app.use(cors());
+app.use(cors({ origin: effectiveCorsOrigins, credentials: true }));
 app.use((req, res, next) => {
   req.traceId = genTraceId(req.headers["x-trace-id"]);
   res.setHeader("x-trace-id", req.traceId);
@@ -59,6 +78,8 @@ const CodeEditorState = require("./modules/CodeEditorState");
 const Article = require("./modules/myData");
 const Report = require("./modules/Report");
 const Match = require("./modules/Match");
+const { hasVerifiedTeachSkill, isBidirectionalMatch, calcMatchScore } = require("./modules/matchingHelpers");
+const { validateSkillTestSubmission } = require("./modules/skillTestRules");
 const path = require("path");
 const objectStorage = require("./services/objectStorage");
 const crypto = require("crypto");
@@ -100,6 +121,57 @@ function escapeHTML(str) {
   );
 }
 
+function evictOldestMapEntry(map, maxSize) {
+  if (map.size <= maxSize) return;
+  const firstKey = map.keys().next().value;
+  if (firstKey !== undefined) map.delete(firstKey);
+}
+
+function cleanupEventQueue(chatId) {
+  const queue = eventQueues.get(chatId);
+  if (queue && !queue.running && queue.items.length === 0) {
+    eventQueues.delete(chatId);
+  }
+}
+
+async function pushNotification(email, notification) {
+  await User.findOneAndUpdate(
+    { email: email.toLowerCase().trim() },
+    {
+      $push: {
+        notifications: {
+          $each: [notification],
+          $slice: -MAX_NOTIFICATIONS,
+        },
+      },
+    }
+  );
+}
+
+async function hasAcceptedMatch(emailA, emailB) {
+  const [userA, userB] = Match.makePair(emailA, emailB);
+  const match = await Match.findOne({ userA, userB, status: "accepted" }).lean();
+  return Boolean(match);
+}
+
+async function canAccessChatRoom(emailA, emailB) {
+  if (await hasAcceptedMatch(emailA, emailB)) return true;
+  const chatId = Match.buildChatId(emailA, emailB);
+  const existing = await Message.exists({ chatId });
+  return Boolean(existing);
+}
+
+function testEndpointGuard(req, res, next) {
+  if (process.env.NODE_ENV === "production" && !process.env.ENABLE_TEST_ENDPOINTS) {
+    return res.status(404).json({ error: "Not found" });
+  }
+  const expectedKey = process.env.TEST_API_KEY;
+  if (expectedKey && req.headers["x-test-api-key"] !== expectedKey) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+  next();
+}
+
 function trackEvent(name) {
   metrics.socketEvents[name] = (metrics.socketEvents[name] || 0) + 1;
 }
@@ -133,6 +205,7 @@ function enqueueChatTask(chatId, task) {
         }
       }
       queue.running = false;
+      cleanupEventQueue(chatId);
     })();
   }
   return true;
@@ -368,6 +441,7 @@ async function loadWhiteboardState(chatId) {
     : { snapshot: null, actions: [], redoStack: [], sessionMeta: {}, assets: [], recordingLog: [] };
   ensureSessionMeta(state, chatId);
   whiteboardStates.set(chatId, state);
+  evictOldestMapEntry(whiteboardStates, MAX_CACHED_CHATS);
   return state;
 }
 
@@ -420,6 +494,7 @@ async function loadCodeEditorState(chatId) {
     ? { content: doc.content || "", language: doc.language || "javascript", revision: doc.revision || 0 }
     : { content: "// ابدأ الكتابة...\n", language: "javascript", revision: 0 };
   codeEditorStates.set(chatId, state);
+  evictOldestMapEntry(codeEditorStates, MAX_CACHED_CHATS);
   return state;
 }
 
@@ -462,13 +537,24 @@ app.use(express.static(path.join(__dirname, "../public")));
 function authMiddleware(req, res, next) {
   const token = req.headers.authorization?.split(" ")[1];
   if (!token) return res.status(401).json({ error: "يجب تسجيل الدخول أولاً" });
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.userId = decoded.id;
-    next();
-  } catch {
-    return res.status(401).json({ error: "جلسة غير صالحة، سجل الدخول مرة أخرى" });
-  }
+  jwt.verify(token, JWT_SECRET, async (err, decoded) => {
+    if (err) {
+      return res.status(401).json({ error: "جلسة غير صالحة، سجل الدخول مرة أخرى" });
+    }
+    try {
+      const user = await User.findById(decoded.id).select("status").lean();
+      if (!user) {
+        return res.status(401).json({ error: "جلسة غير صالحة، سجل الدخول مرة أخرى" });
+      }
+      if (user.status === "banned") {
+        return res.status(403).json({ error: "تم حظر هذا الحساب" });
+      }
+      req.userId = decoded.id;
+      next();
+    } catch {
+      return res.status(500).json({ error: "خطأ في التحقق من الجلسة" });
+    }
+  });
 }
 
 
@@ -512,6 +598,9 @@ app.post("/api/login", async (req, res) => {
     const user = await User.findOne({ email: email.toLowerCase().trim() });
     if (!user) {
       return res.status(401).json({ error: "البريد الإلكتروني أو كلمة المرور غير صحيحة" });
+    }
+    if (user.status === "banned") {
+      return res.status(403).json({ error: "تم حظر هذا الحساب. تواصل مع الدعم." });
     }
     const isMatch = await user.comparePassword(password);
     if (!isMatch) {
@@ -588,17 +677,28 @@ app.post("/api/skills", authMiddleware, async (req, res) => {
 // ═══════════════════════════════════════════════
 app.post("/api/skill-test/submit", authMiddleware, async (req, res) => {
   try {
-    const { skill, score, total, passed, pct } = req.body;
-    if (!skill) return res.status(400).json({ error: "المهارة مطلوبة" });
+    const validation = validateSkillTestSubmission(req.body);
+    if (!validation.ok) {
+      return res.status(400).json({ error: validation.error });
+    }
 
+    const user = await User.findById(req.userId).select("teachSkills verifiedSkills");
+    if (!user) return res.status(404).json({ error: "مستخدم غير موجود" });
+
+    const { skill, score, total, pct, passed } = validation;
     const update = {};
     update[`skillTestResults.${skill}`] = {
-      pct: pct || Math.round((score / total) * 100),
-      passed: passed,
+      pct,
+      passed,
       date: new Date().toISOString(),
+      score,
+      total,
     };
 
     if (passed) {
+      if (!(user.teachSkills || []).includes(skill)) {
+        return res.status(400).json({ error: "المهارة يجب أن تكون ضمن مهارات التعليم الخاصة بك" });
+      }
       await User.findByIdAndUpdate(req.userId, {
         $set: update,
         $addToSet: { verifiedSkills: skill },
@@ -607,8 +707,8 @@ app.post("/api/skill-test/submit", authMiddleware, async (req, res) => {
       await User.findByIdAndUpdate(req.userId, { $set: update });
     }
 
-    const user = await User.findById(req.userId);
-    const safeUser = user.toSafeObject();
+    const updatedUser = await User.findById(req.userId);
+    const safeUser = updatedUser.toSafeObject();
     safeUser.name = safeUser.username1 + " " + safeUser.username2;
     res.json({ user: safeUser, passed });
   } catch (err) {
@@ -621,58 +721,47 @@ app.post("/api/skill-test/submit", authMiddleware, async (req, res) => {
 // ═══════════════════════════════════════════════
 app.get("/api/matches", authMiddleware, async (req, res) => {
   try {
-    // جلب بيانات المستخدم الحالي بـ lean() للسرعة
     const currentUser = await User.findById(req.userId)
-      .select("email learnSkills teachSkills verifiedSkills")
+      .select("email learnSkills teachSkills verifiedSkills status")
       .lean();
-    if (!currentUser || !currentUser.learnSkills.length || !currentUser.teachSkills.length) {
+    if (!currentUser || currentUser.status === "banned") {
+      return res.json({ matches: [] });
+    }
+    if (
+      !currentUser.learnSkills?.length ||
+      !currentUser.teachSkills?.length ||
+      !hasVerifiedTeachSkill(currentUser)
+    ) {
       return res.json({ matches: [] });
     }
 
-    // field projection: نجيب الحقول اللي محتاجينها بس — أسرع بكتير
-    // NOTE: verifiedSkills filter relaxed — users without test results still show up
-    // so new / test accounts can discover matches and accept/reject requests.
+    const matchLimit = Math.max(1, Math.min(Number(req.query.limit) || 50, 100));
     const allUsers = await User.find(
       {
         _id: { $ne: currentUser._id },
-        learnSkills: { $exists: true, $ne: [] },
-        teachSkills: { $exists: true, $ne: [] },
-        status: { $ne: "banned" }, // استثناء المستخدمين المحظورين من المطابقة
+        learnSkills: { $exists: true, $ne: [], $in: currentUser.teachSkills },
+        teachSkills: { $exists: true, $ne: [], $in: currentUser.learnSkills },
+        verifiedSkills: { $exists: true, $not: { $size: 0 } },
+        status: { $ne: "banned" },
       },
-      "email username1 username2 learnSkills teachSkills verifiedSkills avatar bio"
-    ).lean();
+      "email username1 username2 learnSkills teachSkills verifiedSkills bio"
+    )
+      .limit(matchLimit * 3)
+      .lean();
 
     const matches = allUsers
-      .filter((user) => {
-        // يكفي أن يوجد تقاطع في المهارات (بدون اشتراط التحقق) لأغراض الاكتشاف
-        const canTeachMe = user.teachSkills.some((s) =>
-          currentUser.learnSkills.includes(s)
-        );
-        const canLearnFrom = user.learnSkills.some((s) =>
-          currentUser.teachSkills.includes(s)
-        );
-        return canTeachMe && canLearnFrom;
-      })
+      .filter((user) => isBidirectionalMatch(currentUser, user))
       .map((user) => {
-        const uVerified = user.verifiedSkills || [];
-        const myVerified = currentUser.verifiedSkills || [];
-        const learnM = user.teachSkills.filter((s) => currentUser.learnSkills.includes(s)).length;
-        const teachM = user.learnSkills.filter((s) => currentUser.teachSkills.includes(s)).length;
-        // Bonus points for verified skills
-        const learnMV = user.teachSkills.filter((s) => currentUser.learnSkills.includes(s) && uVerified.includes(s)).length;
-        const teachMV = user.learnSkills.filter((s) => currentUser.teachSkills.includes(s) && myVerified.includes(s)).length;
-        const total = currentUser.learnSkills.length + currentUser.teachSkills.length || 1;
-        const matchScore = Math.min(100, Math.round(((learnM + teachM + learnMV + teachMV) / (total * 2)) * 100) || Math.round(((learnM + teachM) / total) * 100));
-        // بناء safe object يدوياً لأن lean() بيشيل الـ methods
         const safe = { ...user };
         delete safe.password;
         safe.name = safe.username1 + " " + safe.username2;
-        safe.matchScore = matchScore;
+        safe.matchScore = calcMatchScore(currentUser, user);
         return safe;
       })
-      .sort((a, b) => b.matchScore - a.matchScore);
+      .sort((a, b) => b.matchScore - a.matchScore)
+      .slice(0, matchLimit);
 
-    res.json({ matches });
+    res.json({ matches, total: matches.length, limit: matchLimit });
   } catch (err) {
     console.log(err);
     res.status(500).json({ error: "خطأ في البحث عن شركاء" });
@@ -682,8 +771,50 @@ app.get("/api/matches", authMiddleware, async (req, res) => {
 // ═══════════════════════════════════════════════
 // 5) CHAT APIs
 // ═══════════════════════════════════════════════
+app.get("/api/chat-access/:email", authMiddleware, async (req, res) => {
+  try {
+    const me = await User.findById(req.userId).select("email status").lean();
+    if (!me) return res.status(404).json({ error: "مستخدم غير موجود" });
+    if (me.status === "banned") {
+      return res.status(403).json({ allowed: false, error: "حسابك محظور" });
+    }
+
+    const otherEmail = req.params.email?.toLowerCase().trim();
+    if (!otherEmail || otherEmail === me.email) {
+      return res.status(400).json({ allowed: false, error: "بريد غير صالح" });
+    }
+
+    const allowed = await canAccessChatRoom(me.email, otherEmail);
+    if (!allowed) {
+      return res.json({
+        allowed: false,
+        error: "يجب قبول طلب المطابقة قبل بدء المحادثة",
+      });
+    }
+
+    const chatId = Match.buildChatId(me.email, otherEmail);
+    res.json({ allowed: true, chatId });
+  } catch (err) {
+    res.status(500).json({ error: "خطأ في التحقق من صلاحية المحادثة" });
+  }
+});
+
 app.get("/api/messages/:chatId", authMiddleware, async (req, res) => {
   try {
+    const me = await User.findById(req.userId).select("email status").lean();
+    if (!me) return res.status(404).json({ error: "مستخدم غير موجود" });
+    if (me.status === "banned") return res.status(403).json({ error: "حسابك محظور" });
+
+    const chatId = req.params.chatId;
+    const members = parseChatMembers(chatId);
+    const peerEmail = members.find((m) => m !== me.email.toLowerCase());
+    if (!peerEmail || !members.includes(me.email.toLowerCase())) {
+      return res.status(403).json({ error: "غير مسموح بالوصول لهذه المحادثة" });
+    }
+    if (!(await canAccessChatRoom(me.email, peerEmail))) {
+      return res.status(403).json({ error: "يجب قبول طلب المطابقة قبل عرض الرسائل" });
+    }
+
     const { before, limit } = req.query;
     const cappedLimit = Math.max(1, Math.min(Number(limit) || 40, 100));
     const filter = { chatId: req.params.chatId };
@@ -712,8 +843,15 @@ app.post("/api/messages", authMiddleware, async (req, res) => {
     const { chatId, receiver, text, attachments, messageId } = req.body;
     const user = await User.findById(req.userId);
     if (!user) return res.status(404).json({ error: "مستخدم غير موجود" });
+    if (user.status === "banned") return res.status(403).json({ error: "حسابك محظور" });
     if (!messageId || typeof messageId !== "string") {
       return res.status(400).json({ error: "messageId مطلوب" });
+    }
+    if (!chatId || !receiver) {
+      return res.status(400).json({ error: "بيانات المحادثة ناقصة" });
+    }
+    if (!(await canAccessChatRoom(user.email, receiver))) {
+      return res.status(403).json({ error: "يجب قبول طلب المطابقة قبل إرسال الرسائل" });
     }
 
     let message = await Message.findOne({ chatId, messageId });
@@ -983,11 +1121,32 @@ app.get("/api/match-requests", authMiddleware, async (req, res) => {
 // POST /api/match-requests — إرسال طلب مطابقة جديد
 app.post("/api/match-requests", authMiddleware, async (req, res) => {
   try {
-    const me = await User.findById(req.userId).select("email username1 username2").lean();
+    const me = await User.findById(req.userId)
+      .select("email username1 username2 teachSkills verifiedSkills status")
+      .lean();
     if (!me) return res.status(404).json({ error: "مستخدم غير موجود" });
+    if (me.status === "banned") {
+      return res.status(403).json({ error: "حسابك محظور" });
+    }
+    if (!hasVerifiedTeachSkill(me)) {
+      return res.status(403).json({
+        error: "يجب اجتياز اختبار مهارة واحدة على الأقل من المهارات التي تعلّمها قبل إرسال طلب مطابقة",
+      });
+    }
+
     const { targetEmail } = req.body;
     if (!targetEmail) return res.status(400).json({ error: "البريد المستهدف مطلوب" });
     if (targetEmail.toLowerCase() === me.email) return res.status(400).json({ error: "لا يمكنك إرسال طلب لنفسك" });
+
+    const target = await User.findOne({ email: targetEmail.toLowerCase().trim() })
+      .select("verifiedSkills status")
+      .lean();
+    if (!target || target.status === "banned") {
+      return res.status(404).json({ error: "المستخدم المستهدف غير موجود" });
+    }
+    if (!(target.verifiedSkills || []).length) {
+      return res.status(403).json({ error: "لا يمكن إرسال طلب مطابقة لمستخدم لم يجتز الاختبار" });
+    }
 
     const [userA, userB] = Match.makePair(me.email, targetEmail);
     const existing = await Match.findOne({ userA, userB });
@@ -1002,22 +1161,14 @@ app.post("/api/match-requests", authMiddleware, async (req, res) => {
       status: "pending",
     });
 
-    // إرسال إشعار للمستخدم المستهدف
     const senderName = me.username1 + " " + me.username2;
-    await User.findOneAndUpdate(
-      { email: targetEmail },
-      {
-        $push: {
-          notifications: {
-            title: "طلب مطابقة جديد",
-            message: `أرسل لك ${senderName} طلب مطابقة لتبادل المهارات`,
-            type: "info",
-            read: false,
-            date: new Date(),
-          }
-        }
-      }
-    );
+    await pushNotification(targetEmail, {
+      title: "طلب مطابقة جديد",
+      message: `أرسل لك ${senderName} طلب مطابقة لتبادل المهارات`,
+      type: "info",
+      read: false,
+      date: new Date(),
+    });
 
     res.status(201).json({ success: true, match });
   } catch (err) {
@@ -1052,20 +1203,13 @@ app.patch("/api/match-requests/:matchId", authMiddleware, async (req, res) => {
 
       // إرسال إشعار للمُبادر
       const responderName = me.username1 + " " + me.username2;
-      await User.findOneAndUpdate(
-        { email: match.initiator },
-        {
-          $push: {
-            notifications: {
-              title: "تم قبول طلب المطابقة! 🎉",
-              message: `قبل ${responderName} طلبك — يمكنك الآن بدء المحادثة`,
-              type: "success",
-              read: false,
-              date: new Date(),
-            }
-          }
-        }
-      );
+      await pushNotification(match.initiator, {
+        title: "تم قبول طلب المطابقة! 🎉",
+        message: `قبل ${responderName} طلبك — يمكنك الآن بدء المحادثة`,
+        type: "success",
+        read: false,
+        date: new Date(),
+      });
     } else {
       match.status = "rejected";
     }
@@ -1208,7 +1352,7 @@ app.get("/api/admin/reports", authMiddleware, async (req, res) => {
 // 8) E2E TESTING HELPERS (Not protected)
 // ═══════════════════════════════════════════════
 
-app.put("/api/test/reset-user", async (req, res) => {
+app.put("/api/test/reset-user", testEndpointGuard, async (req, res) => {
   try {
     // Allows resetting the test user account between E2E runs
     const testEmail = "sharik@gmail.com";
@@ -1220,7 +1364,7 @@ app.put("/api/test/reset-user", async (req, res) => {
   }
 });
 
-app.post("/api/test/seed-match", async (req, res) => {
+app.post("/api/test/seed-match", testEndpointGuard, async (req, res) => {
   try {
     const testEmail = "sharik@gmail.com";
     const partnerEmail = "helper@sharik.com";
@@ -1289,9 +1433,10 @@ io.use(async (socket, next) => {
     const token = socket.handshake.auth?.token;
     if (!token) return next(new Error("UNAUTHORIZED"));
     const decoded = jwt.verify(token, JWT_SECRET);
-    const user = await User.findById(decoded.id);
+    const user = await User.findById(decoded.id).select("email status role").lean();
     if (!user) return next(new Error("UNAUTHORIZED"));
-    socket.user = { id: String(user._id), email: user.email };
+    if (user.status === "banned") return next(new Error("BANNED"));
+    socket.user = { id: String(decoded.id), email: user.email, role: user.role };
     socket.data.joinedChats = new Set();
     socket.data.rl = {};
     next();
@@ -1353,6 +1498,14 @@ io.on("connection", (socket) => {
     if (!canAccessChat(socket, chatId)) {
       socket.emit("socketError", { code: "FORBIDDEN_CHAT", message: "غير مسموح بالدخول لهذه الغرفة" });
       ackErr(ack, traceId, "FORBIDDEN_CHAT", "forbidden");
+      endEvent("joinChat", startedAt, traceId);
+      return;
+    }
+    const members = parseChatMembers(chatId);
+    const peerEmail = members.find((m) => m !== (socket.user?.email || "").toLowerCase());
+    if (!peerEmail || !(await canAccessChatRoom(socket.user.email, peerEmail))) {
+      socket.emit("socketError", { code: "MATCH_REQUIRED", message: "يجب قبول طلب المطابقة قبل الدخول للمحادثة" });
+      ackErr(ack, traceId, "MATCH_REQUIRED", "match_required");
       endEvent("joinChat", startedAt, traceId);
       return;
     }

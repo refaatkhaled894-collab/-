@@ -17,6 +17,9 @@ const matchSchema = new mongoose.Schema(
 
 // Unique index: one match record per pair regardless of order
 matchSchema.index({ userA: 1, userB: 1 }, { unique: true });
+matchSchema.index({ userA: 1, status: 1 });
+matchSchema.index({ userB: 1, status: 1 });
+matchSchema.index({ initiator: 1, status: 1 });
 
 // Helper: canonical pair [sorted]
 matchSchema.statics.makePair = function (emailA, emailB) {

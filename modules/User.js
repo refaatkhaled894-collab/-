@@ -85,6 +85,8 @@ userSchema.index({ learnSkills: 1 });
 userSchema.index({ teachSkills: 1 });
 userSchema.index({ status: 1 });
 userSchema.index({ createdAt: -1 });
+userSchema.index({ status: 1, verifiedSkills: 1, learnSkills: 1, teachSkills: 1 });
+userSchema.index({ email: 1, status: 1 });
 
 const User = mongoose.model("User", userSchema);
 module.exports = User;
