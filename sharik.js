@@ -725,32 +725,50 @@ app.get("/api/matches", authMiddleware, async (req, res) => {
       .select("email learnSkills teachSkills verifiedSkills status")
       .lean();
     if (!currentUser || currentUser.status === "banned") {
-      return res.json({ matches: [] });
+      return res.json({ matches: [], requiresVerification: false });
     }
-    if (
-      !currentUser.learnSkills?.length ||
-      !currentUser.teachSkills?.length ||
-      !hasVerifiedTeachSkill(currentUser)
-    ) {
-      return res.json({ matches: [] });
+
+    const myVerified = currentUser.verifiedSkills || [];
+    const teachSkillsNeedingTest = (currentUser.teachSkills || []).filter(
+      (s) => !myVerified.includes(s)
+    );
+
+    if (!currentUser.learnSkills?.length || !currentUser.teachSkills?.length) {
+      return res.json({
+        matches: [],
+        requiresVerification: false,
+        reason: "missing_skills",
+      });
+    }
+
+    if (!hasVerifiedTeachSkill(currentUser)) {
+      return res.json({
+        matches: [],
+        requiresVerification: true,
+        teachSkillsNeedingTest,
+        reason: "needs_verification",
+      });
     }
 
     const matchLimit = Math.max(1, Math.min(Number(req.query.limit) || 50, 100));
     const allUsers = await User.find(
       {
         _id: { $ne: currentUser._id },
-        learnSkills: { $exists: true, $ne: [], $in: currentUser.teachSkills },
-        teachSkills: { $exists: true, $ne: [], $in: currentUser.learnSkills },
-        verifiedSkills: { $exists: true, $not: { $size: 0 } },
+        learnSkills: { $in: currentUser.teachSkills },
+        teachSkills: { $in: currentUser.learnSkills },
+        verifiedSkills: { $exists: true, $ne: [] },
         status: { $ne: "banned" },
       },
       "email username1 username2 learnSkills teachSkills verifiedSkills bio"
     )
-      .limit(matchLimit * 3)
+      .limit(matchLimit * 5)
       .lean();
 
     const matches = allUsers
-      .filter((user) => isBidirectionalMatch(currentUser, user))
+      .filter(
+        (user) =>
+          isBidirectionalMatch(currentUser, user) && hasVerifiedTeachSkill(user)
+      )
       .map((user) => {
         const safe = { ...user };
         delete safe.password;
@@ -761,7 +779,13 @@ app.get("/api/matches", authMiddleware, async (req, res) => {
       .sort((a, b) => b.matchScore - a.matchScore)
       .slice(0, matchLimit);
 
-    res.json({ matches, total: matches.length, limit: matchLimit });
+    res.json({
+      matches,
+      total: matches.length,
+      limit: matchLimit,
+      requiresVerification: false,
+      reason: matches.length ? "ok" : "no_partners",
+    });
   } catch (err) {
     console.log(err);
     res.status(500).json({ error: "خطأ في البحث عن شركاء" });
