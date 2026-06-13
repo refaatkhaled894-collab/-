@@ -54,6 +54,8 @@ app.use(express.urlencoded({ extended: true, limit: JSON_BODY_LIMIT }));
 app.use(express.json({ limit: JSON_BODY_LIMIT }));
 
 const cors = require("cors");
+const helmet = require("helmet");
+const { rateLimit } = require("express-rate-limit");
 app.use(helmet({
   contentSecurityPolicy: false,
   crossOriginEmbedderPolicy: false,
