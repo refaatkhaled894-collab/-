@@ -109,8 +109,7 @@ const { createSkillTestSession, gradeSkillTestSubmission } = require("./modules/
 const { getSkillsList } = require("./modules/skillQuestionBank");
 const { computeGamification, pointsForNewReview } = require("./modules/gamification");
 const { isEmailConfigured, sendMail } = require("./services/emailService");
-const rateLimit = require("express-rate-limit");
-const helmet = require("helmet");
+
 const path = require("path");
 const objectStorage = require("./services/objectStorage");
 const crypto = require("crypto");
