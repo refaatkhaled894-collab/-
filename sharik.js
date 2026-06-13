@@ -1181,22 +1181,29 @@ app.post("/api/match-requests", authMiddleware, async (req, res) => {
     const match = await Match.create({
       userA,
       userB,
-      initiator: me.email,
+      initiator: me.email.toLowerCase().trim(),
       status: "pending",
     });
 
-    const senderName = me.username1 + " " + me.username2;
-    await pushNotification(targetEmail, {
-      title: "طلب مطابقة جديد",
-      message: `أرسل لك ${senderName} طلب مطابقة لتبادل المهارات`,
-      type: "info",
-      read: false,
-      date: new Date(),
-    });
+    const senderName = (me.username1 || "") + " " + (me.username2 || "");
+    try {
+      await pushNotification(targetEmail, {
+        title: "طلب مطابقة جديد",
+        message: `أرسل لك ${senderName.trim() || me.email} طلب مطابقة لتبادل المهارات`,
+        type: "info",
+        read: false,
+        date: new Date(),
+      });
+    } catch (notifErr) {
+      console.error("تعذر إرسال إشعار طلب المطابقة:", notifErr);
+    }
 
     res.status(201).json({ success: true, match });
   } catch (err) {
     console.error(err);
+    if (err.code === 11000) {
+      return res.status(409).json({ error: "يوجد طلب مطابقة بالفعل بينكما" });
+    }
     res.status(500).json({ error: "خطأ في إرسال طلب المطابقة" });
   }
 });

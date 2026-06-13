@@ -40,5 +40,6 @@ matchSchema.statics.buildChatId = function (emailA, emailB) {
   return `${a}_${b}`;
 };
 
-const Match = mongoose.model("Match", matchSchema);
+// مجموعة منفصلة عن matches القديمة (كان فيها فهرس pairKey_1 يمنع الإنشاء)
+const Match = mongoose.model("Match", matchSchema, "match_requests");
 module.exports = Match;
