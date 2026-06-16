@@ -104,6 +104,7 @@ const CodeEditorState = require("./modules/CodeEditorState");
 const Article = require("./modules/myData");
 const Report = require("./modules/Report");
 const Match = require("./modules/Match");
+const AuditLog = require("./modules/AuditLog");
 const { hasVerifiedTeachSkill, isBidirectionalMatch, calcMatchScore } = require("./modules/matchingHelpers");
 const { createSkillTestSession, gradeSkillTestSubmission } = require("./modules/skillTestService");
 const { getSkillsList } = require("./modules/skillQuestionBank");
@@ -176,6 +177,61 @@ async function pushNotification(email, notification) {
       },
     }
   );
+}
+
+const ADMIN_ROLES = ["super_admin", "admin", "moderator", "support_agent"];
+const ROLE_PERMISSIONS = {
+  super_admin: ["*"],
+  admin: ["dashboard:read", "users:read", "users:write", "skills:write", "exchanges:write", "reports:write", "notifications:write", "settings:write", "audit:read", "backup:write"],
+  moderator: ["dashboard:read", "users:read", "skills:write", "exchanges:write", "reports:write", "notifications:write", "audit:read"],
+  support_agent: ["dashboard:read", "users:read", "reports:write", "notifications:write"],
+};
+
+function getRolePermissions(role = "user") {
+  return ROLE_PERMISSIONS[role] || [];
+}
+
+function hasPermission(role, permission) {
+  const permissions = getRolePermissions(role);
+  return permissions.includes("*") || permissions.includes(permission);
+}
+
+function isRestrictedAccount(user = {}) {
+  if (!user) return true;
+  if (user.status === "suspended") return true;
+  if (user.status !== "banned") return false;
+  if (!user.banUntil) return true;
+  return new Date(user.banUntil).getTime() > Date.now();
+}
+
+async function clearExpiredRestriction(user) {
+  if (user?.status === "banned" && user.banUntil && new Date(user.banUntil).getTime() <= Date.now()) {
+    await User.updateOne(
+      { _id: user._id },
+      { status: "active", banUntil: null, banReason: "" }
+    );
+    return false;
+  }
+  return isRestrictedAccount(user);
+}
+
+async function writeAuditLog(req, action, target = {}, metadata = {}) {
+  try {
+    const actor = req.adminUser || {};
+    await AuditLog.create({
+      actorId: String(actor._id || req.userId || ""),
+      actorEmail: actor.email || "",
+      action,
+      targetType: target.type || "",
+      targetId: String(target.id || ""),
+      targetEmail: target.email || "",
+      metadata,
+      ip: req.ip || "",
+      userAgent: req.headers["user-agent"] || "",
+    });
+  } catch (err) {
+    structuredLog("audit.write_failed", { action, error: err.message });
+  }
 }
 
 async function hasAcceptedMatch(emailA, emailB) {
@@ -577,12 +633,16 @@ function authMiddleware(req, res, next) {
       return res.status(401).json({ error: "جلسة غير صالحة، سجل الدخول مرة أخرى" });
     }
     try {
-      const user = await User.findById(decoded.id).select("status").lean();
+      const user = await User.findById(decoded.id).select("status banUntil banReason").lean();
       if (!user) {
         return res.status(401).json({ error: "جلسة غير صالحة، سجل الدخول مرة أخرى" });
       }
-      if (user.status === "banned") {
-        return res.status(403).json({ error: "تم حظر هذا الحساب" });
+      if (await clearExpiredRestriction(user)) {
+        return res.status(403).json({
+          error: user.status === "suspended" ? "تم إيقاف هذا الحساب" : "تم حظر هذا الحساب",
+          reason: user.banReason || "",
+          until: user.banUntil || null,
+        });
       }
       req.userId = decoded.id;
       next();
@@ -590,6 +650,35 @@ function authMiddleware(req, res, next) {
       return res.status(500).json({ error: "خطأ في التحقق من الجلسة" });
     }
   });
+}
+
+function requireAdmin(permission = "dashboard:read") {
+  return async (req, res, next) => {
+    try {
+      const admin = await User.findById(req.userId).select("-password");
+      if (!admin || !ADMIN_ROLES.includes(admin.role) || !hasPermission(admin.role, permission)) {
+        return res.status(403).json({ error: "غير مصرح لك بالوصول إلى لوحة الإدارة" });
+      }
+      if (await clearExpiredRestriction(admin)) {
+        return res.status(403).json({ error: "الحساب الإداري موقوف أو محظور" });
+      }
+      req.adminUser = admin;
+      next();
+    } catch (err) {
+      res.status(500).json({ error: "خطأ في التحقق من صلاحيات الإدارة" });
+    }
+  };
+}
+
+function ensureAdminCsrf(req, res, next) {
+  if (["GET", "HEAD", "OPTIONS"].includes(req.method)) return next();
+  const expected = req.headers["x-csrf-token"];
+  const token = req.headers.authorization?.split(" ")[1] || "";
+  const actual = crypto.createHash("sha256").update(`${token}:${JWT_SECRET}`).digest("hex");
+  if (!expected || expected !== actual) {
+    return res.status(403).json({ error: "رمز حماية CSRF غير صالح" });
+  }
+  next();
 }
 
 
@@ -644,13 +733,20 @@ app.post("/api/login", async (req, res) => {
     if (!user) {
       return res.status(401).json({ error: "البريد الإلكتروني أو كلمة المرور غير صحيحة" });
     }
-    if (user.status === "banned") {
-      return res.status(403).json({ error: "تم حظر هذا الحساب. تواصل مع الدعم." });
+    if (await clearExpiredRestriction(user)) {
+      return res.status(403).json({
+        error: user.status === "suspended" ? "تم إيقاف هذا الحساب. تواصل مع الدعم." : "تم حظر هذا الحساب. تواصل مع الدعم.",
+        reason: user.banReason || "",
+        until: user.banUntil || null,
+      });
     }
     const isMatch = await user.comparePassword(password);
     if (!isMatch) {
       return res.status(401).json({ error: "البريد الإلكتروني أو كلمة المرور غير صحيحة" });
     }
+    user.lastLoginAt = new Date();
+    if (ADMIN_ROLES.includes(user.role)) user.lastAdminLoginAt = new Date();
+    await user.save();
     const token = jwt.sign({ id: user._id }, JWT_SECRET, { expiresIn: "7d" });
     const safeUser = user.toSafeObject();
     safeUser.name = safeUser.username1 + " " + safeUser.username2;
@@ -1350,6 +1446,431 @@ app.patch("/api/match-requests/:matchId", authMiddleware, async (req, res) => {
 // 7) ADMIN & GAMIFICATION APIs
 // ═══════════════════════════════════════════════
 
+app.use("/api/admin", authMiddleware, requireAdmin("dashboard:read"), ensureAdminCsrf);
+
+app.get("/api/admin/csrf-token", (req, res) => {
+  const token = req.headers.authorization?.split(" ")[1] || "";
+  res.json({
+    csrfToken: crypto.createHash("sha256").update(`${token}:${JWT_SECRET}`).digest("hex"),
+  });
+});
+
+app.get("/api/admin/me", async (req, res) => {
+  const admin = req.adminUser.toObject ? req.adminUser.toObject() : req.adminUser;
+  delete admin.password;
+  res.json({
+    admin,
+    permissions: getRolePermissions(admin.role),
+    twoFactorRequired: ADMIN_ROLES.includes(admin.role) && !admin.twoFactorEnabled,
+  });
+});
+
+app.get("/api/admin/dashboard", async (req, res) => {
+  try {
+    const now = new Date();
+    const dayStart = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    const monthStart = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+
+    const [
+      totalUsers,
+      dailyActiveUsers,
+      monthlyActiveUsers,
+      bannedUsers,
+      suspendedUsers,
+      openComplaints,
+      closedComplaints,
+      totalRequests,
+      completedSessions,
+      pendingRequests,
+      rejectedRequests,
+      messageSessions,
+      verifiedAgg,
+      topTeachSkills,
+      topLearnSkills,
+      activeUsers,
+      recentAudit,
+    ] = await Promise.all([
+      User.countDocuments(),
+      User.countDocuments({ lastLoginAt: { $gte: dayStart } }),
+      User.countDocuments({ lastLoginAt: { $gte: monthStart } }),
+      User.countDocuments({ status: "banned" }),
+      User.countDocuments({ status: "suspended" }),
+      Report.countDocuments({ status: { $in: ["open", "pending", "reviewing"] } }),
+      Report.countDocuments({ status: { $in: ["closed", "resolved", "reviewed"] } }),
+      Match.countDocuments(),
+      Match.countDocuments({ status: "accepted" }),
+      Match.countDocuments({ status: "pending" }),
+      Match.countDocuments({ status: "rejected" }),
+      Message.distinct("chatId"),
+      User.aggregate([
+        { $project: { n: { $size: { $ifNull: ["$verifiedSkills", []] } } } },
+        { $group: { _id: null, total: { $sum: "$n" } } },
+      ]),
+      User.aggregate([
+        { $unwind: "$teachSkills" },
+        { $group: { _id: "$teachSkills", count: { $sum: 1 } } },
+        { $sort: { count: -1 } },
+        { $limit: 8 },
+      ]),
+      User.aggregate([
+        { $unwind: "$learnSkills" },
+        { $group: { _id: "$learnSkills", count: { $sum: 1 } } },
+        { $sort: { count: -1 } },
+        { $limit: 8 },
+      ]),
+      User.find({}, "email username1 username2 reviews verifiedSkills lastLoginAt gamifyPoints")
+        .sort({ lastLoginAt: -1, gamifyPoints: -1 })
+        .limit(8)
+        .lean(),
+      AuditLog.find().sort({ createdAt: -1 }).limit(8).lean(),
+    ]);
+
+    const totalSkills = verifiedAgg[0]?.total || 0;
+    const successRate = totalRequests ? Math.round((completedSessions / totalRequests) * 100) : 0;
+    const complaintRate = totalUsers ? Math.round(((openComplaints + closedComplaints) / totalUsers) * 1000) / 10 : 0;
+    const days = Array.from({ length: 7 }, (_, i) => {
+      const d = new Date(now);
+      d.setDate(now.getDate() - (6 - i));
+      return d;
+    });
+
+    const weeklyUsers = await Promise.all(days.map((d) => {
+      const start = new Date(d);
+      start.setHours(0, 0, 0, 0);
+      const end = new Date(d);
+      end.setHours(23, 59, 59, 999);
+      return User.countDocuments({ createdAt: { $gte: start, $lte: end } });
+    }));
+    const weeklyRequests = await Promise.all(days.map((d) => {
+      const start = new Date(d);
+      start.setHours(0, 0, 0, 0);
+      const end = new Date(d);
+      end.setHours(23, 59, 59, 999);
+      return Match.countDocuments({ createdAt: { $gte: start, $lte: end } });
+    }));
+
+    res.json({
+      stats: {
+        totalUsers,
+        dailyActiveUsers,
+        monthlyActiveUsers,
+        totalSkills,
+        exchangeRequests: totalRequests,
+        completedSessions,
+        openComplaints,
+        closedComplaints,
+        bannedUsers,
+        suspendedUsers,
+        successRate,
+        complaintRate,
+        activeSessions: messageSessions.length,
+        pendingRequests,
+        rejectedRequests,
+      },
+      charts: {
+        labels: days.map((d) => d.toLocaleDateString("ar-EG", { weekday: "short" })),
+        users: weeklyUsers,
+        requests: weeklyRequests,
+      },
+      topSkills: topLearnSkills.map((item) => ({ name: item._id, demand: item.count })),
+      availableSkills: topTeachSkills.map((item) => ({ name: item._id, providers: item.count })),
+      activeUsers: activeUsers.map((u) => ({
+        id: u._id,
+        name: `${u.username1 || ""} ${u.username2 || ""}`.trim() || u.email,
+        email: u.email,
+        verifiedSkills: (u.verifiedSkills || []).length,
+        reviews: (u.reviews || []).length,
+        lastLoginAt: u.lastLoginAt,
+        points: u.gamifyPoints || 0,
+      })),
+      recentAudit,
+      security: {
+        rateLimiting: true,
+        csrfProtection: true,
+        sessionManagement: true,
+        twoFactorAdmins: true,
+      },
+    });
+  } catch (err) {
+    structuredLog("admin.dashboard_failed", { error: err.message });
+    res.status(500).json({ error: "تعذر تحميل إحصائيات لوحة الإدارة" });
+  }
+});
+
+app.get("/api/admin/users", async (req, res) => {
+  try {
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const limit = Math.min(100, Math.max(10, Number(req.query.limit) || 20));
+    const search = String(req.query.search || "").trim();
+    const status = String(req.query.status || "all");
+    const role = String(req.query.role || "all");
+    const sort = String(req.query.sort || "createdAt:desc");
+    const [sortField, sortDir] = sort.split(":");
+    const allowedSort = ["createdAt", "lastLoginAt", "email", "status", "role", "violationCount"];
+    const filter = {};
+
+    if (search) {
+      filter.$or = [
+        { email: { $regex: search, $options: "i" } },
+        { username1: { $regex: search, $options: "i" } },
+        { username2: { $regex: search, $options: "i" } },
+      ];
+    }
+    if (["active", "suspended", "banned"].includes(status)) filter.status = status;
+    if (["user", ...ADMIN_ROLES].includes(role)) filter.role = role;
+
+    const sortSpec = { [allowedSort.includes(sortField) ? sortField : "createdAt"]: sortDir === "asc" ? 1 : -1 };
+    const [users, total] = await Promise.all([
+      User.find(filter, "-password")
+        .sort(sortSpec)
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .lean(),
+      User.countDocuments(filter),
+    ]);
+
+    res.json({
+      users: users.map((u) => ({
+        ...u,
+        role: u.role || "user",
+        status: u.status || "active",
+        isTempBanned: Boolean(u.banUntil && new Date(u.banUntil).getTime() > Date.now()),
+      })),
+      stats: {
+        totalUsers: total,
+        page,
+        limit,
+        totalPages: Math.max(1, Math.ceil(total / limit)),
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ error: "تعذر تحميل المستخدمين" });
+  }
+});
+
+app.get("/api/admin/users/:userId", requireAdmin("users:read"), async (req, res) => {
+  const user = await User.findById(req.params.userId, "-password").lean();
+  if (!user) return res.status(404).json({ error: "المستخدم غير موجود" });
+  const audit = await AuditLog.find({ targetId: String(user._id) }).sort({ createdAt: -1 }).limit(20).lean();
+  res.json({ user, audit });
+});
+
+app.patch("/api/admin/users/:userId", requireAdmin("users:write"), async (req, res) => {
+  try {
+    const allowed = ["username1", "username2", "bio", "role", "teachSkills", "learnSkills", "verifiedSkills"];
+    const patch = {};
+    allowed.forEach((key) => {
+      if (Object.prototype.hasOwnProperty.call(req.body, key)) patch[key] = req.body[key];
+    });
+    if (patch.role && !["user", ...ADMIN_ROLES].includes(patch.role)) {
+      return res.status(400).json({ error: "دور غير صالح" });
+    }
+    if (patch.role && req.adminUser.role !== "super_admin") {
+      return res.status(403).json({ error: "تغيير الأدوار يتطلب Super Admin" });
+    }
+    const user = await User.findByIdAndUpdate(req.params.userId, patch, { new: true, projection: "-password" });
+    if (!user) return res.status(404).json({ error: "المستخدم غير موجود" });
+    await writeAuditLog(req, "user.update", { type: "user", id: user._id, email: user.email }, { patch: Object.keys(patch) });
+    res.json({ success: true, user });
+  } catch (err) {
+    res.status(500).json({ error: "تعذر تعديل المستخدم" });
+  }
+});
+
+app.delete("/api/admin/users/:userId", requireAdmin("users:write"), async (req, res) => {
+  try {
+    const target = await User.findById(req.params.userId);
+    if (!target) return res.status(404).json({ error: "المستخدم غير موجود" });
+    if (ADMIN_ROLES.includes(target.role) && req.adminUser.role !== "super_admin") {
+      return res.status(403).json({ error: "حذف حساب إداري يتطلب Super Admin" });
+    }
+    await User.deleteOne({ _id: target._id });
+    await writeAuditLog(req, "user.delete", { type: "user", id: target._id, email: target.email });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: "تعذر حذف المستخدم" });
+  }
+});
+
+app.put("/api/admin/users/:userId/status", requireAdmin("users:write"), async (req, res) => {
+  try {
+    const { status, reason = "", banUntil = null, durationValue = null, durationUnit = "" } = req.body;
+    if (!["active", "suspended", "banned"].includes(status)) {
+      return res.status(400).json({ error: "حالة غير صحيحة" });
+    }
+    const target = await User.findById(req.params.userId);
+    if (!target) return res.status(404).json({ error: "المستخدم غير موجود" });
+    if (ADMIN_ROLES.includes(target.role) && req.adminUser.role !== "super_admin") {
+      return res.status(403).json({ error: "تعديل حساب إداري يتطلب Super Admin" });
+    }
+
+    let until = banUntil ? new Date(banUntil) : null;
+    if (!until && durationValue && ["hours", "days", "weeks"].includes(durationUnit)) {
+      const unitMs = durationUnit === "hours" ? 3600000 : durationUnit === "days" ? 86400000 : 604800000;
+      until = new Date(Date.now() + Number(durationValue) * unitMs);
+    }
+    target.status = status;
+    target.banReason = status === "active" ? "" : String(reason || "إجراء إداري").slice(0, 500);
+    target.banUntil = status === "banned" && until && Number.isFinite(until.getTime()) ? until : null;
+    if (status !== "active") target.violationCount = Number(target.violationCount || 0) + 1;
+    target.banHistory.push({
+      action: status,
+      reason: target.banReason,
+      until: target.banUntil,
+      by: req.adminUser.email,
+      at: new Date(),
+    });
+    if (req.body.notify !== false && status !== "active") {
+      target.notifications.push({
+        title: status === "suspended" ? "تم إيقاف حسابك مؤقتًا" : "تم تطبيق حظر على حسابك",
+        message: target.banReason || "يرجى مراجعة الدعم لمزيد من التفاصيل.",
+        type: "warning",
+        read: false,
+        date: new Date(),
+      });
+    }
+    await target.save();
+    await writeAuditLog(req, `user.${status}`, { type: "user", id: target._id, email: target.email }, {
+      reason: target.banReason,
+      until: target.banUntil,
+      notify: req.body.notify !== false,
+    });
+    res.json({ success: true, status: target.status, banUntil: target.banUntil, banReason: target.banReason });
+  } catch (err) {
+    res.status(500).json({ error: "تعذر تحديث حالة المستخدم" });
+  }
+});
+
+app.post("/api/admin/users/:userId/unban", requireAdmin("users:write"), async (req, res) => {
+  try {
+    const target = await User.findById(req.params.userId);
+    if (!target) return res.status(404).json({ error: "المستخدم غير موجود" });
+    if (ADMIN_ROLES.includes(target.role) && req.adminUser.role !== "super_admin") {
+      return res.status(403).json({ error: "تعديل حساب إداري يتطلب Super Admin" });
+    }
+    target.status = "active";
+    target.banReason = "";
+    target.banUntil = null;
+    target.banHistory.push({
+      action: "unban",
+      reason: req.body.reason || "فك حظر يدوي",
+      by: req.adminUser.email,
+      at: new Date(),
+    });
+    await target.save();
+    await writeAuditLog(req, "user.unban", { type: "user", id: target._id, email: target.email });
+    res.json({ success: true, status: target.status });
+  } catch (err) {
+    res.status(500).json({ error: "تعذر فك الحظر" });
+  }
+});
+
+app.get("/api/admin/skills", async (req, res) => {
+  try {
+    const [teach, learn, verified] = await Promise.all([
+      User.aggregate([{ $unwind: "$teachSkills" }, { $group: { _id: "$teachSkills", providers: { $sum: 1 } } }, { $sort: { providers: -1 } }]),
+      User.aggregate([{ $unwind: "$learnSkills" }, { $group: { _id: "$learnSkills", demand: { $sum: 1 } } }, { $sort: { demand: -1 } }]),
+      User.aggregate([{ $unwind: "$verifiedSkills" }, { $group: { _id: "$verifiedSkills", verified: { $sum: 1 } } }]),
+    ]);
+    const rows = new Map();
+    teach.forEach((x) => rows.set(x._id, { name: x._id, providers: x.providers, demand: 0, verified: 0, status: "approved" }));
+    learn.forEach((x) => rows.set(x._id, { ...(rows.get(x._id) || { name: x._id, providers: 0, verified: 0, status: "approved" }), demand: x.demand }));
+    verified.forEach((x) => rows.set(x._id, { ...(rows.get(x._id) || { name: x._id, providers: 0, demand: 0, status: "approved" }), verified: x.verified }));
+    res.json({ skills: Array.from(rows.values()).sort((a, b) => b.demand - a.demand) });
+  } catch (err) {
+    res.status(500).json({ error: "تعذر تحميل المهارات" });
+  }
+});
+
+app.get("/api/admin/exchanges", async (req, res) => {
+  const page = Math.max(1, Number(req.query.page) || 1);
+  const limit = Math.min(100, Math.max(10, Number(req.query.limit) || 25));
+  const status = String(req.query.status || "all");
+  const filter = ["pending", "accepted", "rejected"].includes(status) ? { status } : {};
+  const [requests, total] = await Promise.all([
+    Match.find(filter).sort({ updatedAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
+    Match.countDocuments(filter),
+  ]);
+  res.json({ requests, stats: { total, page, limit, totalPages: Math.max(1, Math.ceil(total / limit)) } });
+});
+
+app.patch("/api/admin/exchanges/:id", requireAdmin("exchanges:write"), async (req, res) => {
+  const { status } = req.body;
+  if (!["pending", "accepted", "rejected"].includes(status)) return res.status(400).json({ error: "حالة غير صالحة" });
+  const request = await Match.findByIdAndUpdate(req.params.id, { status }, { new: true });
+  if (!request) return res.status(404).json({ error: "طلب التبادل غير موجود" });
+  await writeAuditLog(req, "exchange.update", { type: "exchange", id: request._id }, { status });
+  res.json({ success: true, request });
+});
+
+app.get("/api/admin/reports", async (req, res) => {
+  const page = Math.max(1, Number(req.query.page) || 1);
+  const limit = Math.min(100, Math.max(10, Number(req.query.limit) || 25));
+  const status = String(req.query.status || "all");
+  const filter = ["open", "pending", "reviewing", "reviewed", "resolved", "closed"].includes(status) ? { status } : {};
+  const [reports, total] = await Promise.all([
+    Report.find(filter).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
+    Report.countDocuments(filter),
+  ]);
+  res.json({ reports, stats: { total, page, limit, totalPages: Math.max(1, Math.ceil(total / limit)) } });
+});
+
+app.patch("/api/admin/reports/:id", requireAdmin("reports:write"), async (req, res) => {
+  const patch = {};
+  ["status", "adminNotes", "actionTaken"].forEach((key) => {
+    if (Object.prototype.hasOwnProperty.call(req.body, key)) patch[key] = req.body[key];
+  });
+  if (patch.status && !["open", "pending", "reviewing", "reviewed", "resolved", "closed"].includes(patch.status)) {
+    return res.status(400).json({ error: "حالة شكوى غير صالحة" });
+  }
+  patch.handledBy = req.adminUser.email;
+  patch.handledAt = new Date();
+  const report = await Report.findByIdAndUpdate(req.params.id, patch, { new: true });
+  if (!report) return res.status(404).json({ error: "الشكوى غير موجودة" });
+  await writeAuditLog(req, "report.update", { type: "report", id: report._id, email: report.reportedEmail }, patch);
+  res.json({ success: true, report });
+});
+
+app.post("/api/admin/notifications", requireAdmin("notifications:write"), async (req, res) => {
+  const { target = "all", email = "", title = "", message = "", type = "info" } = req.body;
+  if (!title || !message) return res.status(400).json({ error: "العنوان والرسالة مطلوبان" });
+  const notification = { title: title.slice(0, 120), message: message.slice(0, 700), type, read: false, date: new Date() };
+  let result;
+  if (target === "single") {
+    result = await User.updateOne({ email: email.toLowerCase().trim() }, { $push: { notifications: notification } });
+  } else if (target === "admins") {
+    result = await User.updateMany({ role: { $in: ADMIN_ROLES } }, { $push: { notifications: notification } });
+  } else {
+    result = await User.updateMany({}, { $push: { notifications: notification } });
+  }
+  await writeAuditLog(req, "notification.send", { type: "notification" }, { target, email, count: result.modifiedCount || 0 });
+  res.json({ success: true, sent: result.modifiedCount || 0 });
+});
+
+app.get("/api/admin/audit-logs", requireAdmin("audit:read"), async (req, res) => {
+  const page = Math.max(1, Number(req.query.page) || 1);
+  const limit = Math.min(100, Math.max(10, Number(req.query.limit) || 30));
+  const [logs, total] = await Promise.all([
+    AuditLog.find().sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
+    AuditLog.countDocuments(),
+  ]);
+  res.json({ logs, stats: { total, page, limit, totalPages: Math.max(1, Math.ceil(total / limit)) } });
+});
+
+app.get("/api/admin/settings", requireAdmin("settings:write"), async (req, res) => {
+  res.json({
+    settings: {
+      siteName: "Sharik",
+      emailProvider: isEmailConfigured() ? "configured" : "not_configured",
+      notificationsEnabled: true,
+      bannersEnabled: true,
+      contentModeration: true,
+      forbiddenWords: ["spam", "abuse"],
+      backupSchedule: "daily",
+    },
+  });
+});
+
 // Get all users for admin dashboard (محمي بالـ role)
 app.get("/api/admin/users", authMiddleware, async (req, res) => {
   try {
@@ -1618,9 +2139,9 @@ io.use(async (socket, next) => {
     const token = socket.handshake.auth?.token;
     if (!token) return next(new Error("UNAUTHORIZED"));
     const decoded = jwt.verify(token, JWT_SECRET);
-    const user = await User.findById(decoded.id).select("email status role").lean();
+    const user = await User.findById(decoded.id).select("email status role banUntil").lean();
     if (!user) return next(new Error("UNAUTHORIZED"));
-    if (user.status === "banned") return next(new Error("BANNED"));
+    if (await clearExpiredRestriction(user)) return next(new Error("RESTRICTED"));
     socket.user = { id: String(decoded.id), email: user.email, role: user.role };
     socket.data.joinedChats = new Set();
     socket.data.rl = {};

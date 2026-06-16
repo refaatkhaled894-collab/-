@@ -39,8 +39,31 @@ const userSchema = new Schema(
       }
     ],
     // 🛡 Admin Roles and Status
-    role: { type: String, enum: ["user", "admin"], default: "user" },
-    status: { type: String, enum: ["active", "banned"], default: "active" },
+    role: {
+      type: String,
+      enum: ["user", "super_admin", "admin", "moderator", "support_agent"],
+      default: "user",
+    },
+    status: {
+      type: String,
+      enum: ["active", "suspended", "banned"],
+      default: "active",
+    },
+    banReason: { type: String, default: "" },
+    banUntil: { type: Date, default: null },
+    banHistory: [
+      {
+        action: String,
+        reason: String,
+        until: Date,
+        by: String,
+        at: { type: Date, default: Date.now },
+      }
+    ],
+    violationCount: { type: Number, default: 0 },
+    twoFactorEnabled: { type: Boolean, default: false },
+    lastLoginAt: { type: Date, default: null },
+    lastAdminLoginAt: { type: Date, default: null },
 
     resetPasswordToken: { type: String, default: "" },
     resetPasswordExpires: { type: Date, default: null },
@@ -88,6 +111,8 @@ userSchema.index({ learnSkills: 1 });
 userSchema.index({ teachSkills: 1 });
 userSchema.index({ status: 1 });
 userSchema.index({ createdAt: -1 });
+userSchema.index({ lastLoginAt: -1 });
+userSchema.index({ role: 1, status: 1 });
 userSchema.index({ status: 1, verifiedSkills: 1, learnSkills: 1, teachSkills: 1 });
 userSchema.index({ email: 1, status: 1 });
 
