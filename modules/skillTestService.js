@@ -95,4 +95,41 @@ function gradeSkillTestSubmission(jwtSecret, userId, { sessionToken, answers, sk
   };
 }
 
-module.exports = { createSkillTestSession, gradeSkillTestSubmission };
+function gradeSkillTestAnswer(jwtSecret, userId, { sessionToken, questionIndex, answer, skill }) {
+  if (!sessionToken) {
+    return { ok: false, error: "بيانات الاختبار غير مكتملة" };
+  }
+
+  let decoded;
+  try {
+    decoded = jwt.verify(sessionToken, jwtSecret);
+  } catch {
+    return { ok: false, error: "انتهت صلاحية جلسة الاختبار، أعد المحاولة" };
+  }
+
+  if (decoded.type !== "skill_test" || String(decoded.userId) !== String(userId)) {
+    return { ok: false, error: "جلسة اختبار غير صالحة" };
+  }
+
+  const sessionSkill = (decoded.skill || "").trim();
+  if (skill && skill.trim() !== sessionSkill) {
+    return { ok: false, error: "المهارة لا تطابق جلسة الاختبار" };
+  }
+
+  const answerKey = decoded.answerKey || [];
+  const index = Number(questionIndex);
+  const chosen = Number(answer);
+  if (!Number.isInteger(index) || index < 0 || index >= answerKey.length) {
+    return { ok: false, error: "رقم السؤال غير صالح" };
+  }
+  if (!Number.isInteger(chosen) || chosen < 0) {
+    return { ok: false, error: "الإجابة غير صالحة" };
+  }
+
+  return {
+    ok: true,
+    correct: chosen === Number(answerKey[index]),
+  };
+}
+
+module.exports = { createSkillTestSession, gradeSkillTestSubmission, gradeSkillTestAnswer };

@@ -24,6 +24,8 @@ const userSchema = new Schema(
         pct: Number,
         passed: Boolean,
         date: String,
+        score: Number,
+        total: Number,
       },
       default: {},
     },

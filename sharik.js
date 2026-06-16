@@ -106,7 +106,11 @@ const Report = require("./modules/Report");
 const Match = require("./modules/Match");
 const AuditLog = require("./modules/AuditLog");
 const { hasVerifiedTeachSkill, isBidirectionalMatch, calcMatchScore } = require("./modules/matchingHelpers");
-const { createSkillTestSession, gradeSkillTestSubmission } = require("./modules/skillTestService");
+const {
+  createSkillTestSession,
+  gradeSkillTestSubmission,
+  gradeSkillTestAnswer,
+} = require("./modules/skillTestService");
 const { getSkillsList } = require("./modules/skillQuestionBank");
 const { computeGamification, pointsForNewReview } = require("./modules/gamification");
 const { isEmailConfigured, sendMail } = require("./services/emailService");
@@ -844,6 +848,25 @@ app.post("/api/skill-test/start", authMiddleware, async (req, res) => {
   }
 });
 
+app.post("/api/skill-test/check-answer", authMiddleware, async (req, res) => {
+  try {
+    const { sessionToken, questionIndex, answer, skill } = req.body;
+    const checked = gradeSkillTestAnswer(JWT_SECRET, req.userId, {
+      sessionToken,
+      questionIndex,
+      answer,
+      skill,
+    });
+    if (!checked.ok) {
+      return res.status(400).json({ error: checked.error });
+    }
+    return res.json({ correct: checked.correct });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "خطأ في فحص الإجابة" });
+  }
+});
+
 app.post("/api/skill-test/submit", authMiddleware, async (req, res) => {
   try {
     const { sessionToken, answers, skill } = req.body;
@@ -858,7 +881,7 @@ app.post("/api/skill-test/submit", authMiddleware, async (req, res) => {
         return res.status(400).json({ error: graded.error });
       }
 
-      const user = await User.findById(req.userId).select("teachSkills verifiedSkills");
+      const user = await User.findById(req.userId).select("verifiedSkills");
       if (!user) return res.status(404).json({ error: "مستخدم غير موجود" });
 
       const { skill: gradedSkill, score, total, pct, passed } = graded;
@@ -872,9 +895,6 @@ app.post("/api/skill-test/submit", authMiddleware, async (req, res) => {
       };
 
       if (passed) {
-        if (!(user.teachSkills || []).includes(gradedSkill)) {
-          return res.status(400).json({ error: "المهارة يجب أن تكون ضمن مهارات التعليم الخاصة بك" });
-        }
         await User.findByIdAndUpdate(req.userId, {
           $set: update,
           $addToSet: { verifiedSkills: gradedSkill },

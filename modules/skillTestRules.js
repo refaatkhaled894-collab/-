@@ -46,5 +46,6 @@ function validateSkillTestSubmission({ skill, score, total, passed, pct }) {
 module.exports = {
   SKILL_TEST_QUESTION_COUNT,
   SKILL_TEST_PASS_PCT,
+  SKILL_TEST_MIN_PASS_SCORE,
   validateSkillTestSubmission,
 };
